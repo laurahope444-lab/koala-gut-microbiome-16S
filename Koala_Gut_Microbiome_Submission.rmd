@@ -1,0 +1,2608 @@
+---
+title: "Koala_Gut_Microbiome_Submission"
+author: "Laura Marshall"
+date: "2025-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Required Packages 
+
+```{r}
+library("ape")
+library("plyr")
+library("readr")
+library("microbiome")
+library("lattice")
+library("colorspace")
+library("RColorBrewer")
+library("vegan")
+library("microbiome")
+library("jsonlite")
+```
+
+```{r}
+library(phyloseq)
+library(tidyverse)  # Load this AFTER phyloseq
+library(knitr)
+
+# Explicitly attach dplyr to avoid conflicts
+library(dplyr)
+```
+
+## Importing files and Creating Phyloseq Object
+
+```{r}
+# Import taxonomy file
+taxonomy <- read_csv("taxonomy-deblur.csv")
+
+# Look at the structure
+print("Columns in taxonomy file:")
+print(colnames(taxonomy))
+
+# Split ONLY the Taxon column, ignore the Confidence column
+taxonomy_split <- taxonomy %>%
+  select(`Feature ID`, Taxon) %>%
+  separate(Taxon,
+           into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"),
+           sep = ";",
+           fill = "right")
+
+# Clean up taxonomic names - remove prefixes
+tax_cols <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+for(col in tax_cols) {
+  taxonomy_split[[col]] <- gsub("^[a-z]__", "", taxonomy_split[[col]])
+  taxonomy_split[[col]][taxonomy_split[[col]] == ""] <- NA
+}
+
+# Convert to matrix
+taxmat <- as.matrix(taxonomy_split[, -1])
+rownames(taxmat) <- taxonomy_split$`Feature ID`
+
+# Check the results
+print("Sample of cleaned taxonomy:")
+print(head(taxmat))
+
+# Count assignments at each level
+for(level in tax_cols) {
+  assigned <- sum(!is.na(taxmat[, level]))
+  cat(level, ":", assigned, "out of", nrow(taxmat), "assigned\n")
+}
+```
+
+```{r}
+# Import OTU file
+uparse_otus <- read_csv("feature-table-deblur.csv")
+
+# Keep the original feature IDs for linking
+feature_ids <- uparse_otus[, 1, drop = TRUE]  # Extract first column as vector
+
+# Create numeric OTU matrix (without first column) 
+otumat <- as.matrix(uparse_otus[, -1])
+otumat <- apply(otumat, 2, as.numeric)
+
+# Use the ORIGINAL feature IDs as row names 
+rownames(otumat) <- feature_ids
+
+# Check what the sample names (column names) look like
+print("Sample names from OTU table:")
+print(colnames(otumat))
+```
+
+```{r}
+# Create phyloseq object
+OTU = otu_table(otumat, taxa_are_rows = TRUE)
+TAX = tax_table(taxmat)
+physeq = phyloseq(OTU, TAX)
+
+print("Sample names from phyloseq:")
+print(sample_names(physeq))
+```
+
+```{r}
+MyTree2 <- read.tree("rooted-tree-deblur.nwk")
+```
+
+```{r}
+# Read metadata
+meta_data <- read_csv("BNP_Koala_Metadata copy.csv")
+
+# Match metadata to phyloseq sample order 
+meta_data_matched <- meta_data %>%
+  filter(`sample-id` %in% sample_names(physeq)) %>%
+  arrange(match(`sample-id`, sample_names(physeq))) %>%
+  as.data.frame()
+rownames(meta_data_matched) <- meta_data_matched$`sample-id`
+
+# Build sample_data and confirm alignment
+sampledata <- sample_data(meta_data_matched)
+print(identical(sample_names(physeq), rownames(sampledata)))   # must be TRUE
+
+# Create final phyloseq object
+ps <- merge_phyloseq(physeq, sampledata, MyTree2)
+ps
+```
+
+```{r}
+# Simple checks on phyloseq created
+
+nsamples(ps)       # number of samples
+ntaxa(ps)          # number of taxa (OTUs)
+sample_names(ps)[1:5]  # sample names - first five
+rank_names(ps)   # taxonomic ranks e.g. Phylum, Kingdom
+sample_variables(ps) # metadata variables
+otu_table(ps)[1:5, 1:5] # first 5 otus (no. of reads) and first 5 samples
+tax_table(ps)[1:5, 1:4] # first 5 samples and taxonomy first 4 columns 
+myTaxa = names(sort(taxa_sums(ps), decreasing = TRUE)[5:20])
+```
+
+```{r}
+#re-named phyloseq object
+ps_corrected <- ps
+```
+
+### Rarefy Data
+
+```{r}
+# Check sequencing depth before rarefaction
+cat("=== SEQUENCING DEPTH SUMMARY ===\n")
+read_depths <- sample_sums(ps_corrected)
+cat("Minimum:", min(read_depths), "\n")
+cat("Maximum:", max(read_depths), "\n")
+cat("Mean:", round(mean(read_depths)), "\n")
+cat("Median:", round(median(read_depths)), "\n\n")
+
+# Rarefaction to minimum depth to retain all samples
+rarefaction_depth <- min(sample_sums(ps_corrected))
+
+cat("=== RAREFACTION ===\n")
+cat("Rarefying to", rarefaction_depth, "reads per sample\n")
+cat("This will retain all", nsamples(ps_corrected), "samples\n\n")
+
+# Perform rarefaction
+set.seed(123)  # For reproducibility
+ps_rarefied <- rarefy_even_depth(ps_corrected, 
+                                 sample.size = rarefaction_depth,
+                                 rngseed = 123,
+                                 replace = FALSE,
+                                 trimOTUs = TRUE,
+                                 verbose = TRUE)
+
+cat("\n=== RAREFACTION COMPLETE ===\n")
+cat("Original samples:", nsamples(ps_corrected), "\n")
+cat("Rarefied samples:", nsamples(ps_rarefied), "\n")
+cat("Original taxa:", ntaxa(ps_corrected), "\n")
+cat("Rarefied taxa:", ntaxa(ps_rarefied), "\n\n")
+
+# Verify sample data was preserved
+cat("Sample variables preserved:\n")
+print(sample_variables(ps_rarefied))
+```
+
+### BLAST Analysis on unclassified taxa 
+
+- 7 ASVs refined from NCBI BLASTn (>=97% identity) where SILVA was conservative.
+- Evidence: Table_S1_BLAST_refinements.csv (SILVA vs BLAST, % identity per ASV).
+- 5 refined to genus, 2 to family — see manuscript section 3.8 / 4.1.
+
+```{r}
+# Applying Manual Taxonomy Corrections
+
+manual_classifications <- data.frame(
+  ASV_ID = c(
+    "2477f60ea27cb685e328e91cab767e09",
+    "ad98e7c8fb84f6feda85bcba8d6efec7",
+    "4181e9969535cd337d54e158c8c0d2ac",
+    "05e24c47bb7ba6c59aaed904807f7236",
+    "ab98951517cde2405a9bdacf1e173603",
+    "49ec24be0235b197009fc5bdd72016ae",
+    "71c9e9d321c57138def0af49ce5e2b58"
+  ),
+  Genus = c("Desulfovibrio", "Desulfovibrio", NA, "Enterocloster",
+            NA, "Klebsiella", "Blautia"),
+  Family = c("Desulfovibrionaceae", "Desulfovibrionaceae", "Bacteroidaceae",
+             "Lachnospiraceae", "Enterobacteriaceae", "Enterobacteriaceae",
+             "Lachnospiraceae"),
+  stringsAsFactors = FALSE
+)
+
+tax_df <- as.data.frame(tax_table(ps_rarefied))
+for (i in seq_len(nrow(manual_classifications))) {
+  asv_id <- manual_classifications$ASV_ID[i]
+  if (asv_id %in% rownames(tax_df)) {
+    if (!is.na(manual_classifications$Genus[i]))
+      tax_df[asv_id, "Genus"] <- manual_classifications$Genus[i]
+    if (!is.na(manual_classifications$Family[i]))
+      tax_df[asv_id, "Family"] <- manual_classifications$Family[i]
+  } else {
+    cat("WARNING:", asv_id, "not found in taxonomy table\n")
+  }
+}
+tax_table(ps_rarefied) <- as.matrix(tax_df)
+
+cat("\n=== MANUAL CORRECTIONS COMPLETE ===\n")
+cat("Updated", nrow(manual_classifications), "ASVs\n\n")
+
+cat("Verification of updated ASVs:\n")
+print(tax_table(ps_rarefied)[manual_classifications$ASV_ID, c("Family", "Genus")])
+
+# Apply the SAME corrections to ps_corrected (unrarefied) so DESeq2 taxon labels match 
+tax_df_corr <- as.data.frame(tax_table(ps_corrected))
+for (i in seq_len(nrow(manual_classifications))) {
+  asv_id <- manual_classifications$ASV_ID[i]
+  if (asv_id %in% rownames(tax_df_corr)) {
+    if (!is.na(manual_classifications$Genus[i]))
+      tax_df_corr[asv_id, "Genus"] <- manual_classifications$Genus[i]
+    if (!is.na(manual_classifications$Family[i]))
+      tax_df_corr[asv_id, "Family"] <- manual_classifications$Family[i]
+  } else {
+    cat("WARNING (ps_corrected):", asv_id, "not found\n")
+  }
+}
+tax_table(ps_corrected) <- as.matrix(tax_df_corr)
+cat("\nps_corrected also updated. Verification:\n")
+print(tax_table(ps_corrected)[manual_classifications$ASV_ID, c("Family", "Genus")])
+```
+
+```{r}
+### Supplementary Table 2
+### Taxonomic analysis of ASVs unclassified at genus level
+### Grouped by Integron group -> Phylum/Class/Order, with ASV count + mean relative abundance (%)
+
+library(phyloseq); library(dplyr); library(tidyr)
+
+# Per-sample relative abundance (%) on the rarefied object
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)
+
+# Long format: one row per ASV x sample, carrying taxonomy + integron group
+melted <- psmelt(ps_rel)
+
+# Keep only ASVs UNCLASSIFIED at genus level
+# (Genus is NA, or empty, or an "uncultured"/"unclassified" placeholder)
+unclassified_genus <- melted %>%
+  filter(is.na(Genus) | Genus %in% c("", "uncultured", "Unclassified", "unclassified"))
+
+# Mean relative abundance per Integron group x Order
+# = for each ASV, mean % across that group's samples, then summed within Phylum/Class/Order
+#   (so the value is the group's mean % contributed by genus-unclassified ASVs of that order)
+table2 <- unclassified_genus %>%
+  # relabel NA ranks for display
+  mutate(
+    Phylum = ifelse(is.na(Phylum), "Unclassified", Phylum),
+    Class  = ifelse(is.na(Class),  "Unclassified", Class),
+    Order  = ifelse(is.na(Order),  "Unclassified", Order)
+  ) %>%
+  # per ASV within a group: mean % across samples; n samples per group cancels out via mean
+  group_by(Integron_group, Phylum, Class, Order, OTU) %>%
+  summarise(asv_mean_pct = mean(Abundance), .groups = "drop") %>%
+  # collapse ASVs of the same Phylum/Class/Order: count ASVs + sum their mean %
+  group_by(Integron_group, Phylum, Class, Order) %>%
+  summarise(
+    n_ASVs = n_distinct(OTU),
+    mean_rel_abund_pct = round(sum(asv_mean_pct), 2),
+    .groups = "drop"
+  ) %>%
+  # order rows: by group, then descending abundance
+  group_by(Integron_group) %>%
+  arrange(desc(mean_rel_abund_pct), .by_group = TRUE) %>%
+  ungroup()
+
+# Keep orders contributing >= 0.1% in at least one integron group
+table2_filtered <- table2 %>%
+  group_by(Phylum, Class, Order) %>%
+  filter(max(mean_rel_abund_pct) >= 0.1) %>%
+  ungroup() %>%
+  group_by(Integron_group) %>%
+  arrange(desc(mean_rel_abund_pct), .by_group = TRUE) %>%
+  ungroup()
+
+print(as.data.frame(table2_filtered))
+
+print(as.data.frame(table2))
+write.csv(table2, "supp_table2_unclassified_genus.csv", row.names = FALSE)
+```
+
+### Rarefaction curve 
+
+```{r}
+library(vegan)
+library(ggplot2)
+library(tidyverse)
+
+# Build a plain numeric matrix (samples as rows) for vegan
+otu_mat <- t(as(otu_table(ps_corrected), "matrix"))
+rarefaction_depth <- min(rowSums(otu_mat))
+
+# Rarefaction curves (slow — a few minutes for 62 samples)
+rare_data <- rarecurve(otu_mat, step = 1000, tidy = TRUE)
+colnames(rare_data) <- c("Sample", "Reads", "ASVs")
+
+# Join metadata
+meta_df <- data.frame(sample_data(ps_corrected))
+meta_df$Sample <- rownames(meta_df)
+rare_data <- rare_data %>%
+  left_join(meta_df %>% select(Sample, Integron_group, Location_group), by = "Sample")
+
+# Saturation at rarefaction depth
+saturation <- rare_data %>%
+  group_by(Sample) %>%
+  summarize(
+    max_ASVs       = max(ASVs),
+    ASVs_at_rare   = ASVs[which.min(abs(Reads - rarefaction_depth))],
+    saturation_pct = (ASVs_at_rare / max_ASVs) * 100,
+    .groups = "drop"
+  )
+
+cat("Rarefaction depth:", rarefaction_depth, "reads\n")
+cat("Mean saturation:", round(mean(saturation$saturation_pct), 1), "%",
+    "| Range:", round(min(saturation$saturation_pct), 1), "-",
+    round(max(saturation$saturation_pct), 1), "%\n")
+
+# Supplementary Figure 1
+p <- ggplot(rare_data, aes(x = Reads, y = ASVs, group = Sample)) +
+  geom_line(aes(color = Integron_group), alpha = 0.5, linewidth = 0.8) +
+  geom_vline(xintercept = rarefaction_depth, linetype = "dashed",
+             color = "red", linewidth = 1.2) +
+  annotate("text", x = rarefaction_depth * 1.05, y = max(rare_data$ASVs) * 0.95,
+           label = paste0("Rarefaction depth\n(", format(rarefaction_depth, big.mark = ","), " reads)"),
+           hjust = 0, color = "red", size = 4, fontface = "bold") +
+  scale_color_manual(values = c("Positive" = "#E41A1C", "Negative" = "#377EB8"),
+                     name = "Class 1 Integron Status") +
+  labs(x = "Number of Reads Sequenced", y = "Number of ASVs Observed") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        legend.title = element_text(face = "bold", size = 14))
+
+print(p)
+ggsave("Supplementary_Figure_Rarefaction_Curves.pdf", p, width = 10, height = 7, dpi = 300)
+ggsave("Supplementary_Figure_Rarefaction_Curves.png", p, width = 10, height = 7, dpi = 300)
+
+# Supplementary Table 1 source data
+write.csv(saturation, "individual_sample_saturation.csv", row.names = FALSE)
+```
+
+### Creating read counts for supplementary table 1
+
+```{r}
+library(tidyverse); library(knitr)
+
+sample_order <- c(
+  "BNP-001","BNP-002","BNP-004","BNP-007","BNP-009","BNP-010","BNP-011",
+  "BNP-013","BNP-014","BNP-016","BNP-017","BNP-019","BNP-021","BNP-022",
+  "BNP-023","BNP-025","BNP-026","BNP-027","BNP-028","BNP-034","BNP-035",
+  "BNP-036","BNP-040","BNP-041","BNP-042","BNP-043","BNP-044","BNP-045",
+  "BNP-046","BNP-047","BNP-048","BNP-051","BNP-052","BNP-053","BNP-055",
+  "BNP-057","BNP-059","BNP-060","BNP-064","BNP-065","BNP-066","BNP-067",
+  "BNP-069","BNP-070","BNP-071","BNP-072","BNP-073","BNP-075","BNP-076",
+  "BNP-078","BNP-081","BNP-082","BNP-087","BNP-088","BNP-089","BNP-090",
+  "BNP-091","BNP-092","BNP-095","BNP-096","BNP-097","BNP-099"
+)
+
+read_counts <- sample_sums(ps_corrected)
+meta_df     <- data.frame(sample_data(ps_corrected))
+asv_counts  <- colSums(otu_table(ps_corrected) > 0)
+
+full_sample_names <- names(read_counts)
+bnp_ids <- sapply(strsplit(full_sample_names, "-POW"), function(x) x[1])
+
+read_table <- data.frame(
+  Full_Sample_ID  = full_sample_names,
+  Sample_ID       = bnp_ids,
+  Integron_Status = meta_df$Integron_group[match(full_sample_names, rownames(meta_df))],
+  Location        = meta_df$Location_group[match(full_sample_names, rownames(meta_df))],
+  Sex             = meta_df$Sex[match(full_sample_names, rownames(meta_df))],
+  Read_Count      = as.numeric(read_counts),
+  ASVs_Observed   = as.numeric(asv_counts)
+)
+
+# Saturation via base-R match (no select/rename → avoids package masking)
+read_table$Saturation_Percent <- saturation$saturation_pct[
+  match(read_table$Full_Sample_ID, saturation$Sample)
+]
+
+# Reorder by custom sample order, drop the long POW ID
+read_table <- read_table[order(factor(read_table$Sample_ID, levels = sample_order)), ]
+read_table$Full_Sample_ID <- NULL
+
+cat("=== INDIVIDUAL SAMPLE READ COUNTS TABLE ===\n\n")
+print(kable(read_table, format = "pipe",
+            col.names = c("Sample ID","Integron Status","Location","Sex",
+                          "Read Count","ASVs Observed","Saturation (%)"),
+            digits = 1))
+
+write.csv(read_table, "Supplementary_Table_S1_Read_Counts.csv", row.names = FALSE)
+```
+
+## Visualising Relative Abundance 
+
+
+### Phylum-Level Comparison Figure
+
+```{r}
+## Visualising Relative Abundance 
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+
+# Convert to relative abundance
+ps_rel_abund <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)
+
+# Replace NA phyla with "Unclassified"
+tax_table_modified <- tax_table(ps_rel_abund)
+tax_table_modified[is.na(tax_table_modified[,"Phylum"]), "Phylum"] <- "Unclassified"
+tax_table(ps_rel_abund) <- tax_table_modified
+
+# Agglomerate by phylum
+ps_phylum <- phyloseq::tax_glom(ps_rel_abund, "Phylum", NArm = FALSE)
+
+# Split by group
+ps_negative <- subset_samples(ps_phylum, Integron_group == "Negative")
+ps_positive <- subset_samples(ps_phylum, Integron_group == "Positive")
+
+# Create plot A - Integron Negative (n=38)
+plot_a <- phyloseq::plot_bar(ps_negative, fill = "Phylum") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1),
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    plot.margin = margin(5, 2, 5, 5)
+  ) +
+  labs(y = "Relative Abundance")
+
+# Create plot B - Integron Positive (n=24)
+plot_b <- phyloseq::plot_bar(ps_positive, fill = "Phylum") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1),
+    legend.position = "right",
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.key.size = unit(0.8, "cm"),
+    axis.title.x = element_blank(),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    axis.text.y = element_text(size = 14, color = "black"),
+    plot.margin = margin(5, 5, 5, 2)
+  ) +
+  labs(y = "Relative Abundance")
+
+# Combine with panel labels
+final_plot <- (plot_a | plot_b) +
+  plot_annotation(tag_levels = 'a') +
+  plot_layout(widths = c(38, 24)) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+print(final_plot)
+
+# Save graph as png
+ggsave("Figure_phylum_composition_rarefied.png", 
+       plot = final_plot,
+       width = 11, 
+       height = 7, 
+       dpi = 300, 
+       bg = "white")
+```
+
+### Phylum-Level Comparison Table
+
+```{r}
+library(phyloseq); library(dplyr); library(tidyr)
+
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)  # per-sample %
+
+# Relabel NA phyla as "Unclassified" (best-available; phylum rarely NA)
+tax_mod <- tax_table(ps_rel)
+tax_mod[is.na(tax_mod[, "Phylum"]), "Phylum"] <- "Unclassified"
+tax_table(ps_rel) <- tax_mod
+
+ps_phylum <- phyloseq::tax_glom(ps_rel, "Phylum", NArm = FALSE)
+
+# MEAN of per-sample percentages (consistent with family and genus)
+phylum_table <- psmelt(ps_phylum) %>%
+  group_by(Integron_group, Phylum) %>%
+  summarise(mean_rel_abund_pct = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Integron_group) %>%
+  arrange(desc(mean_rel_abund_pct), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>% ungroup()
+
+print(phylum_table, n = 50)
+write.csv(phylum_table, "phylum_relabund_rarefied.csv", row.names = FALSE)
+```
+
+### Family-Level Comparison Table
+
+```{r}
+library(phyloseq); library(dplyr); library(tidyr)
+
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)  # per-sample %
+ps_family <- phyloseq::tax_glom(ps_rel, taxrank = "Family", NArm = FALSE)
+
+# >1% filter + best-available labelling (your original logic)
+integron_groups <- sample_data(ps_family)$Integron_group
+otu_family <- as.data.frame(otu_table(ps_family))
+group_means <- data.frame(
+  Negative = rowMeans(otu_family[, integron_groups == "Negative", drop = FALSE]),
+  Positive = rowMeans(otu_family[, integron_groups == "Positive", drop = FALSE])
+)
+max_ab <- pmax(group_means$Negative, group_means$Positive)
+keep_taxa  <- rownames(group_means)[max_ab > 1]      # note: >1 because data is now in %
+other_taxa <- rownames(group_means)[max_ab <= 1]
+
+tax_mod <- tax_table(ps_family)
+for (taxon in keep_taxa) {
+  fam <- tax_mod[taxon, "Family"]; ord <- tax_mod[taxon, "Order"]; cls <- tax_mod[taxon, "Class"]
+  if (!is.na(fam))      tax_mod[taxon, "Family"] <- fam
+  else if (!is.na(ord)) tax_mod[taxon, "Family"] <- paste0(ord, " (o)")
+  else if (!is.na(cls)) tax_mod[taxon, "Family"] <- paste0(cls, " (c)")
+  else                  tax_mod[taxon, "Family"] <- "Unclassified"
+}
+tax_mod[other_taxa, "Family"] <- "Others"
+tax_table(ps_family) <- tax_mod
+ps_family_final <- phyloseq::tax_glom(ps_family, "Family", NArm = FALSE)
+
+# MEAN of per-sample percentages (consistent with phylum)
+family_table <- psmelt(ps_family_final) %>%
+  group_by(Integron_group, Family) %>%
+  summarise(mean_rel_abund_pct = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Integron_group) %>%
+  arrange(desc(mean_rel_abund_pct), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>% ungroup()
+
+print(family_table, n = 50)
+write.csv(family_table, "family_relabund_rarefied.csv", row.names = FALSE)
+```
+
+### Genus-Level Comparison Figure (>1% in at least one group)
+
+```{r}
+library(phyloseq); library(ggplot2); library(patchwork)
+
+ps_rel_abund <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)  # match phylum: %
+ps_genus <- phyloseq::tax_glom(ps_rel_abund, taxrank = "Genus", NArm = FALSE)
+
+integron_groups <- sample_data(ps_genus)$Integron_group
+otu_genus <- as.data.frame(otu_table(ps_genus))
+group_means <- data.frame(
+  Negative = rowMeans(otu_genus[, integron_groups == "Negative", drop = FALSE]),
+  Positive = rowMeans(otu_genus[, integron_groups == "Positive", drop = FALSE])
+)
+max_ab <- pmax(group_means$Negative, group_means$Positive)
+keep_taxa  <- rownames(group_means)[max_ab > 1]      # threshold now on % scale
+other_taxa <- rownames(group_means)[max_ab <= 1]
+
+tax_mod <- tax_table(ps_genus)
+known_families <- c("Muribaculaceae", "vadinHA49")
+for (taxon in keep_taxa) {
+  genus <- tax_mod[taxon, "Genus"]; family <- tax_mod[taxon, "Family"]; order <- tax_mod[taxon, "Order"]
+  if (!is.na(genus) && genus %in% known_families) {
+    tax_mod[taxon, "Genus"] <- paste0(genus, " (f)")
+  } else if (!is.na(genus) && genus != "uncultured" && genus != "") {
+    tax_mod[taxon, "Genus"] <- genus
+  } else if (!is.na(family) && family != "uncultured" && family != "") {
+    tax_mod[taxon, "Genus"] <- paste0(family, " (f)")
+  } else if (!is.na(order) && order != "uncultured" && order != "") {
+    tax_mod[taxon, "Genus"] <- paste0(order, " (o)")
+  } else {
+    tax_mod[taxon, "Genus"] <- "Others"
+  }
+}
+for (taxon in other_taxa) tax_mod[taxon, ] <- "Others"
+tax_table(ps_genus) <- tax_mod
+ps_final <- phyloseq::tax_glom(ps_genus, "Genus", NArm = FALSE)
+
+cat("Genera >1%:", length(keep_taxa), "| Final groups (incl. Others):", ntaxa(ps_final), "\n")
+
+ps_negative <- subset_samples(ps_final, Integron_group == "Negative")
+ps_positive <- subset_samples(ps_final, Integron_group == "Positive")
+
+# Match phylum theme exactly (base_size 14, all text 14)
+bar_theme <- theme_bw(base_size = 14) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        axis.text.y = element_text(size = 14, color = "black"))
+
+plot_a <- phyloseq::plot_bar(ps_negative, fill = "Genus") + bar_theme +
+  theme(legend.position = "none", plot.margin = margin(5, 2, 5, 5)) +
+  labs(y = "Relative Abundance")
+plot_b <- phyloseq::plot_bar(ps_positive, fill = "Genus") + bar_theme +
+  theme(legend.position = "right", legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.key.size = unit(0.8, "cm"), plot.margin = margin(5, 5, 5, 2)) +
+  labs(y = "Relative Abundance")
+
+final_plot <- (plot_a | plot_b) + plot_annotation(tag_levels = "a") +
+  plot_layout(widths = c(38, 24)) &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+print(final_plot)
+
+ggsave("Figure_genus_composition_rarefied.png", final_plot, width = 11, height = 7, dpi = 300, bg = "white")
+ggsave("Figure_genus_composition_rarefied.pdf", final_plot, width = 11, height = 7)
+ggsave("Figure_genus_composition_rarefied.tiff", final_plot, width = 11, height = 7, dpi = 300, compression = "lzw")
+```
+
+
+#### Relative Abundance Table (Genera)
+
+```{r}
+library(phyloseq); library(dplyr); library(tidyr)
+
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)  # per-sample %
+ps_genus <- phyloseq::tax_glom(ps_rel, taxrank = "Genus", NArm = FALSE)
+
+integron_groups <- sample_data(ps_genus)$Integron_group
+otu_genus <- as.data.frame(otu_table(ps_genus))
+group_means <- data.frame(
+  Negative = rowMeans(otu_genus[, integron_groups == "Negative", drop = FALSE]),
+  Positive = rowMeans(otu_genus[, integron_groups == "Positive", drop = FALSE])
+)
+max_ab <- pmax(group_means$Negative, group_means$Positive)
+keep_taxa  <- rownames(group_means)[max_ab > 1]
+other_taxa <- rownames(group_means)[max_ab <= 1]
+
+# Best-available labelling with known_families (your original logic)
+tax_mod <- tax_table(ps_genus)
+known_families <- c("Muribaculaceae", "vadinHA49")
+for (taxon in keep_taxa) {
+  genus <- tax_mod[taxon, "Genus"]; family <- tax_mod[taxon, "Family"]; order <- tax_mod[taxon, "Order"]
+  if (!is.na(genus) && genus %in% known_families) {
+    tax_mod[taxon, "Genus"] <- paste0(genus, " (f)")
+  } else if (!is.na(genus) && genus != "uncultured" && genus != "") {
+    tax_mod[taxon, "Genus"] <- genus
+  } else if (!is.na(family) && family != "uncultured" && family != "") {
+    tax_mod[taxon, "Genus"] <- paste0(family, " (f)")
+  } else if (!is.na(order) && order != "uncultured" && order != "") {
+    tax_mod[taxon, "Genus"] <- paste0(order, " (o)")
+  } else {
+    tax_mod[taxon, "Genus"] <- "Others"
+  }
+}
+for (taxon in other_taxa) tax_mod[taxon, ] <- "Others"
+tax_table(ps_genus) <- tax_mod
+ps_genus_final <- phyloseq::tax_glom(ps_genus, "Genus", NArm = FALSE)
+
+cat("Genera >1%:", length(keep_taxa), "| Final groups (incl. Others):", ntaxa(ps_genus_final), "\n")
+
+# MEAN of per-sample percentages (consistent with phylum)
+genus_table <- psmelt(ps_genus_final) %>%
+  group_by(Integron_group, Genus) %>%
+  summarise(mean_rel_abund_pct = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Integron_group) %>%
+  arrange(desc(mean_rel_abund_pct), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>% ungroup()
+
+print(genus_table, n = 50)
+write.csv(genus_table, "genus_relabund_rarefied.csv", row.names = FALSE)
+```
+
+
+### Pseudomonadaceae analysis
+```{r}
+# Pseudomonadaceae by integron group — below-threshold exploration
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x))
+tax_df <- as.data.frame(tax_table(ps_rel))
+
+# Get Pseudomonadaceae ASVs (Family level)
+pseudo_asvs <- rownames(tax_df)[tax_df$Family == "Pseudomonadaceae" & !is.na(tax_df$Family)]
+cat("Pseudomonadaceae ASVs found:", length(pseudo_asvs), "\n\n")
+
+otu_mat <- as.matrix(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) otu_mat <- t(otu_mat)
+pseudo_abund <- colSums(otu_mat[pseudo_asvs, , drop = FALSE]) * 100  # as %
+
+pseudo_df <- data.frame(
+  Sample = names(pseudo_abund),
+  Pseudomonadaceae = pseudo_abund,
+  Integron_group = sample_data(ps_rel)$Integron_group
+)
+
+# Per-group summary: mean, max, and how many samples have ANY (presence)
+library(dplyr)
+pseudo_summary <- pseudo_df %>%
+  group_by(Integron_group) %>%
+  summarise(
+    n              = n(),
+    mean_pct       = round(mean(Pseudomonadaceae), 4),
+    median_pct     = round(median(Pseudomonadaceae), 4),
+    max_pct        = round(max(Pseudomonadaceae), 4),
+    n_present      = sum(Pseudomonadaceae > 0),        # samples with any reads
+    n_absent       = sum(Pseudomonadaceae == 0),       # true zeros
+    .groups = "drop"
+  )
+cat("Pseudomonadaceae by integron group:\n")
+print(as.data.frame(pseudo_summary))
+
+# Optional: test the difference (Wilcoxon, since it's not normal/low-abundance)
+wilcox_pseudo <- wilcox.test(Pseudomonadaceae ~ Integron_group, data = pseudo_df)
+cat("\nWilcoxon p =", round(wilcox_pseudo$p.value, 4), "\n")
+```
+
+### Enterobacteriaceae Analysis 
+
+```{r}
+# Enterobacteriaceae by integron group
+entero_asvs <- rownames(tax_df)[tax_df$Family == "Enterobacteriaceae" & !is.na(tax_df$Family)]
+cat("Enterobacteriaceae ASVs found:", length(entero_asvs), "\n\n")
+
+entero_abund <- colSums(otu_mat[entero_asvs, , drop = FALSE]) * 100  # as %
+entero_df <- data.frame(
+  Sample = names(entero_abund),
+  Enterobacteriaceae = entero_abund,
+  Integron_group = sample_data(ps_rel)$Integron_group
+)
+entero_summary <- entero_df %>%
+  group_by(Integron_group) %>%
+  summarise(n = n(), mean_pct = round(mean(Enterobacteriaceae), 4),
+            median_pct = round(median(Enterobacteriaceae), 4),
+            max_pct = round(max(Enterobacteriaceae), 4),
+            n_present = sum(Enterobacteriaceae > 0),
+            n_absent = sum(Enterobacteriaceae == 0), .groups = "drop")
+print(as.data.frame(entero_summary))
+wilcox_entero <- wilcox.test(Enterobacteriaceae ~ Integron_group, data = entero_df)
+cat("\nWilcoxon p =", round(wilcox_entero$p.value, 4), "\n")
+```
+
+
+## Alpha Diversity - Shannon, Simpson & Observed
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+
+p_observed <- ps_rarefied %>%
+  plot_richness(
+    x = "Integron_group",
+    measures = "Observed"
+  ) +
+  geom_boxplot(aes(fill = Integron_group), show.legend = FALSE, outlier.shape = 16) +
+  labs(
+    x = "Integron Group",
+    y = "Observed ASVs",
+    title = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+p_shannon <- ps_rarefied %>%
+  plot_richness(
+    x = "Integron_group",
+    measures = "Shannon"
+  ) +
+  geom_boxplot(aes(fill = Integron_group), show.legend = FALSE, outlier.shape = 16) +
+  labs(
+    x = "Integron Group",
+    y = "Shannon Index",
+    title = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+p_simpson <- ps_rarefied %>%
+  plot_richness(
+    x = "Integron_group",
+    measures = "Simpson"
+  ) +
+  geom_boxplot(aes(fill = Integron_group), show.legend = FALSE, outlier.shape = 16) +
+  labs(
+    x = "Integron Group",
+    y = "Simpson Index",
+    title = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+final_plot <- (p_observed | p_shannon | p_simpson) +
+  plot_annotation(tag_levels = 'a') &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+print(final_plot)
+
+ggsave(
+  "alpha_diversity_figure_rarefied.png",
+  plot = final_plot,
+  width = 11,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+#### Signifigance analysis: Kruskall Wallis
+
+```{r}
+library(phyloseq)
+
+# Calculate diversity measures
+div_measures <- estimate_richness(ps_rarefied, measures = c("Observed", "Shannon", "Simpson"))
+div_measures$Group <- data.frame(sample_data(ps_rarefied))$Integron_group
+
+# Run Kruskal-Wallis tests
+for (measure in c("Observed", "Shannon", "Simpson")) {
+  result <- kruskal.test(div_measures[[measure]], div_measures$Group)
+  cat("Kruskal-Wallis", measure, ": chi2 =", round(result$statistic, 2),
+      ", p =", round(result$p.value, 3), "\n")
+}
+```
+
+```{r}
+sum(otu_table(ps_rarefied))
+mean(sample_sums(ps_rarefied))
+```
+
+```{r}
+# does re-running rarefaction with the seed reproduce THIS run's numbers?
+set.seed(123)
+ps_test <- rarefy_even_depth(ps_corrected, sample.size = 14555, rngseed = 123,
+                             replace = FALSE, trimOTUs = TRUE)
+dm <- estimate_richness(ps_test, measures = c("Observed","Shannon","Simpson"))
+dm$Group <- data.frame(sample_data(ps_test))$Integron_group
+for (m in c("Observed","Shannon","Simpson")) {
+  r <- kruskal.test(dm[[m]], dm$Group)
+  cat(m, ": chi2 =", round(r$statistic,2), "p =", round(r$p.value,3), "\n")
+}
+```
+
+## Beta Diversity - Unifrac Distances, Bray-Curtis & NMDS
+
+### NMDS Bray-Curtis + UniFrac PCoA + Bray-Curtis integron PERMANOVA + betadisper
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+
+# Extract data from RAREFIED phyloseq object
+sample_data_df <- as.data.frame(sample_data(ps_rarefied), check.names = FALSE)
+reads <- as.matrix(t(otu_table(ps_rarefied)))
+
+env_for_fit <- data.frame(
+  Integron_group = factor(sample_data_df[["Integron_group"]]),
+  row.names = rownames(sample_data_df)
+)
+
+# Run NMDS on Bray-Curtis
+set.seed(123)
+ord <- metaMDS(reads, distance = "bray", k = 2, trymax = 100)
+cat("NMDS stress:", round(ord$stress, 3), "\n")
+
+# Bray-Curtis integron PERMANOVA + betadisper
+bray_dist <- vegdist(reads, method = "bray")
+set.seed(123)
+permanova_bray <- adonis2(bray_dist ~ Integron_group, data = env_for_fit, permutations = 999)
+cat("\n=== PERMANOVA on Bray-Curtis ===\n"); print(permanova_bray)
+
+disp_bray <- betadisper(bray_dist, env_for_fit$Integron_group)
+cat("\n=== Betadisper (Bray-Curtis) ===\n"); print(anova(disp_bray))
+
+# Shared theme for all three panels
+beta_theme <- theme_bw(base_size = 14) +
+  theme(axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 14, color = "black"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 14),
+        legend.position = "bottom",
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 1),
+        plot.margin = margin(5, 5, 5, 5))
+
+# Panel a — NMDS Bray-Curtis
+plot_data <- data.frame(
+  NMDS1 = as.numeric(ord$points[, 1]),
+  NMDS2 = as.numeric(ord$points[, 2]),
+  Integron_group = factor(env_for_fit$Integron_group)
+)
+p_nmds <- ggplot(plot_data, aes(x = NMDS1, y = NMDS2, color = Integron_group)) +
+  geom_point(size = 4, shape = 16) +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2, linewidth = 0.8, show.legend = FALSE) +
+  annotate("text", x = Inf, y = -Inf, label = paste("Stress =", round(ord$stress, 3)),
+           hjust = 1.1, vjust = -0.5, size = 4, fontface = "italic") +
+  labs(x = "NMDS1", y = "NMDS2", color = "Integron Group") +
+  beta_theme + scale_color_brewer(palette = "Set2")
+
+# Panel b — Weighted UniFrac PCoA
+weighted <- UniFrac(ps_rarefied, weighted = TRUE, normalized = TRUE, parallel = FALSE, fast = TRUE)
+pcoa_weighted <- ordinate(ps_rarefied, "PCoA", distance = weighted)
+var_w <- round(pcoa_weighted$values$Eigenvalues / sum(pcoa_weighted$values$Eigenvalues) * 100, 1)
+p_weighted <- plot_ordination(ps_rarefied, pcoa_weighted, color = "Integron_group") +
+  geom_point(size = 4, shape = 16) +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2, linewidth = 0.8, show.legend = FALSE) +
+  labs(x = paste0("PCoA 1 (", var_w[1], "%)"), y = paste0("PCoA 2 (", var_w[2], "%)"), color = "Integron Group") +
+  beta_theme + scale_color_brewer(palette = "Set2")
+
+# Panel c — Unweighted UniFrac PCoA
+unweighted <- UniFrac(ps_rarefied, weighted = FALSE, normalized = TRUE, parallel = FALSE, fast = TRUE)
+pcoa_unweighted <- ordinate(ps_rarefied, "PCoA", distance = unweighted)
+var_u <- round(pcoa_unweighted$values$Eigenvalues / sum(pcoa_unweighted$values$Eigenvalues) * 100, 1)
+p_unweighted <- plot_ordination(ps_rarefied, pcoa_unweighted, color = "Integron_group") +
+  geom_point(size = 4, shape = 16) +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2, linewidth = 0.8, show.legend = FALSE) +
+  labs(x = paste0("PCoA 1 (", var_u[1], "%)"), y = paste0("PCoA 2 (", var_u[2], "%)"), color = "Integron Group") +
+  beta_theme + scale_color_brewer(palette = "Set2")
+
+# Combine (stacked a/b/c, single shared legend)
+final_plot <- (p_nmds / p_weighted / p_unweighted) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'a') &
+  theme(plot.tag = element_text(size = 14, face = "bold"), legend.position = "bottom")
+print(final_plot)
+
+ggsave("beta_diversity_combined.png", final_plot, width = 8, height = 11, dpi = 300, bg = "white")
+ggsave("beta_diversity_combined.pdf", final_plot, width = 8, height = 11)
+ggsave("beta_diversity_combined.tiff", final_plot, width = 8, height = 11, dpi = 300, compression = "lzw")
+```
+### Unifrac PERMANOVA (weighted + unweighted)
+```{r}
+library(vegan); library(phyloseq)
+sample_df <- data.frame(sample_data(ps_rarefied)) 
+
+sample_df$Integron_group <- factor(sample_df$Integron_group) 
+
+# Weighted UniFrac PERMANOVA
+set.seed(123)
+permanova_weighted <- adonis2(weighted ~ Integron_group, data = sample_df, permutations = 999) 
+cat("=== Weighted UniFrac ===\n"); print(permanova_weighted)
+
+# Unweighted UniFrac PERMANOVA
+set.seed(123)
+permanova_unweighted <- adonis2(unweighted ~ Integron_group, data = sample_df, permutations = 999) 
+cat("\n=== Unweighted UniFrac ===\n"); print(permanova_unweighted)
+
+```
+```{r}
+# Betadisper (dispersion check) for the two UniFrac distances — mirrors the Bray-Curtis check
+# Confirms the groups have comparable spread, so the non-significant PERMANOVAs aren't a dispersion artifact.
+
+# Weighted UniFrac
+disp_weighted <- betadisper(weighted, sample_df$Integron_group)
+cat("\n=== Betadisper (Weighted UniFrac) ===\n"); print(anova(disp_weighted))
+
+# Unweighted UniFrac
+disp_unweighted <- betadisper(unweighted, sample_df$Integron_group)
+cat("\n=== Betadisper (Unweighted UniFrac) ===\n"); print(anova(disp_unweighted))
+```
+
+### Per-variable PERMANOVA (Bray-Curtis) (Supplementary Table 5)
+
+One koala (of 62) lacks location data, so Location analyses use n = 61, while descriptive tables retain all 62 with NA shown.
+
+```{r}
+# testing each variable individually against community composition
+
+library(vegan); library(phyloseq)
+
+bray_dist <- phyloseq::distance(ps_rarefied, method = "bray") 
+metadata  <- as(sample_data(ps_rarefied), "data.frame") 
+
+# Clean-named columns (as() mangles names with dots)
+metadata$Age       <- factor(metadata$`TWC...Estimated.age`)
+metadata$Weight    <- as.numeric(metadata$`Animal.Weight..Kg.`)
+metadata$Chlamydia <- factor(ifelse(metadata$`Chlamydia.UGT` == "0", "Negative", "Positive"),
+                             levels = c("Negative", "Positive"))
+metadata$Sex       <- factor(metadata$Sex)
+metadata$BCS       <- factor(metadata$BCS)
+
+run_permanova <- function(var) {
+  set.seed(123)
+  adonis2(as.formula(paste("bray_dist ~", var)), data = metadata, permutations = 999)
+}
+# 
+
+cat("INTEGRON:\n");   print(run_permanova("Integron_group"))
+cat("SEX:\n");        print(run_permanova("Sex"))
+cat("BCS:\n");        print(run_permanova("BCS"))
+cat("AGE:\n");        print(run_permanova("Age"))
+cat("WEIGHT:\n");     print(run_permanova("Weight"))
+cat("CHLAMYDIA:\n");  print(run_permanova("Chlamydia"))
+
+# Location: drop NA-location sample, factor (3 groups -> Df = 2)
+metadata_location <- metadata[!is.na(metadata$Location_group), ]
+metadata_location$Location_group <- factor(metadata_location$Location_group)
+keep <- rownames(metadata_location) 
+bray_loc <- as.dist(as.matrix(bray_dist)[keep, keep])
+
+set.seed(123)
+cat("LOCATION:\n")
+print(adonis2(bray_loc ~ Location_group, data = metadata_location, permutations = 999))
+```
+
+
+### 4-panel host-variable NMDS 
+
+```{r}
+
+library(phyloseq); library(vegan); library(ggplot2); library(patchwork); library(viridis)
+
+sample_data_df <- as.data.frame(sample_data(ps_rarefied), check.names = FALSE)
+reads <- as.matrix(t(otu_table(ps_rarefied)))
+
+# Environmental data (actual original column names)
+env_for_fit <- data.frame(
+  Sex       = factor(sample_data_df[["Sex"]]),
+  Age       = factor(sample_data_df[["TWC - Estimated age"]]),
+  Weight    = as.numeric(sample_data_df[["Animal Weight (Kg)"]]),
+  Chlamydia = factor(sample_data_df[["Chlamydia UGT"]]),
+  row.names = rownames(sample_data_df)
+)
+
+set.seed(123)
+ord <- metaMDS(reads, distance = "bray", k = 2, trymax = 100)
+cat("NMDS stress:", round(ord$stress, 3), "\n")
+
+plot_data <- data.frame(
+  NMDS1 = as.numeric(ord$points[, 1]),
+  NMDS2 = as.numeric(ord$points[, 2]),
+  Sex = env_for_fit$Sex, Age = env_for_fit$Age,
+  Weight = env_for_fit$Weight, Chlamydia = env_for_fit$Chlamydia
+)
+# Shortened age labels
+plot_data$Age_short <- factor(plot_data$Age,
+  levels = c("Dependent", "TWC I -Sub Adult", "TWC II -1.6 - 2.5 years", "TWC III - 2.5 - 4 years",
+             "TWC IV -3.5-5.5 years", "TWC V - 5-6.5 years", "TWC VI - 6.5- 10 years", "TWC VII - 9- 12 years"),
+  labels = c("Dependent", "Sub Adult", "1.6-2.5 yrs", "2.5-4 yrs", "3.5-5.5 yrs", "5-6.5 yrs", "6.5-10 yrs", "9-12 yrs"))
+
+# Make Chlamydia binary
+plot_data$Chlamydia_binary <- factor(ifelse(plot_data$Chlamydia == "0", "Absent", "Present"),
+                                     levels = c("Absent", "Present"))
+
+base_theme <- theme_bw(base_size = 14) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", linewidth = 1),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12, color = "black"),
+        legend.position = "bottom",
+        legend.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+
+p1 <- ggplot(plot_data, aes(NMDS1, NMDS2, color = Sex)) +
+  geom_point(size = 3, alpha = 0.7, shape = 16) + scale_color_brewer(palette = "Set2") +
+  labs(title = "Sex", x = "NMDS1", y = "NMDS2", color = "Sex") + base_theme + guides(color = guide_legend(nrow = 1))
+p2 <- ggplot(plot_data, aes(NMDS1, NMDS2, color = Age_short)) +
+  geom_point(size = 3, alpha = 0.7, shape = 16) + scale_color_brewer(palette = "Set2") +
+  labs(title = "Age", x = "NMDS1", y = "NMDS2", color = "Age Class") + base_theme + guides(color = guide_legend(nrow = 2, byrow = TRUE))
+p3 <- ggplot(plot_data, aes(NMDS1, NMDS2, color = Weight)) +
+  geom_point(size = 3, alpha = 0.7, shape = 16) + scale_color_viridis_c(option = "plasma") +
+  labs(title = "Weight", x = "NMDS1", y = "NMDS2", color = "Weight (kg)") + base_theme
+p4 <- ggplot(plot_data, aes(NMDS1, NMDS2, color = Chlamydia_binary)) +
+  geom_point(size = 3, alpha = 0.7, shape = 16) + scale_color_brewer(palette = "Set2") +
+  labs(title = "Chlamydia Status", x = "NMDS1", y = "NMDS2", color = "Chlamydia") + base_theme
+
+multi_panel <- (p1 | p2) / (p3 | p4) +
+  plot_annotation(tag_levels = 'a') &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+print(multi_panel)
+
+ggsave("NMDS_multipanel_host_variables.png", multi_panel, width = 12, height = 10, dpi = 300, bg = "white")
+ggsave("NMDS_multipanel_host_variables.pdf", multi_panel, width = 12, height = 10)
+ggsave("NMDS_multipanel_host_variables.tiff", multi_panel, width = 12, height = 10, dpi = 300, compression = "lzw")
+```
+
+
+### Multivariate PERMANOVA: host and environmental predictors
+
+Multivariate model, all seven predictors in one formula, tested simultaneously with marginal SS
+
+```{r}
+library(vegan); library(phyloseq)
+
+# Metadata, preserving original column names (spaces intact)
+meta <- data.frame(sample_data(ps_rarefied), check.names = FALSE)
+
+# Keep only samples with complete data across all predictors (drops 1 sample missing location → n = 61)
+meta_cc <- meta[complete.cases(meta[, c("Integron_group", "Location_group", "Sex", "BCS",
+          "TWC - Estimated age", "Animal Weight (Kg)", "Chlamydia UGT")]), ]
+
+
+# Set predictor classes (categorical as factors, weight numeric)
+meta_cc$Location_group <- factor(meta_cc$Location_group)
+meta_cc$Sex            <- factor(meta_cc$Sex)
+meta_cc$BCS            <- factor(meta_cc$BCS)
+meta_cc$Age            <- factor(meta_cc[["TWC - Estimated age"]])
+meta_cc$Weight         <- as.numeric(meta_cc[["Animal Weight (Kg)"]])
+meta_cc$Chlamydia      <- factor(meta_cc[["Chlamydia UGT"]])
+
+# Bray-Curtis dissimilarity for the same 61 samples
+ps_cc   <- prune_samples(rownames(meta_cc), ps_rarefied)
+bray_cc <- phyloseq::distance(ps_cc, method = "bray")
+
+# Multivariate PERMANOVA — marginal (Type III) sums of squares
+set.seed(123) # for reproducability
+Mv_permanova <- adonis2(bray_cc ~ Integron_group + Location_group + Sex + BCS + Age + Weight + Chlamydia,
+                     data = meta_cc, permutations = 999, by = "margin")
+print(Mv_permanova)
+
+```
+
+```{r}
+# Betadisper (dispersion check) for the two SIGNIFICANT terms
+
+
+# Location
+disp_location <- betadisper(bray_cc, meta_cc$Location_group)
+cat("\n=== Betadisper (Location) ===\n"); print(anova(disp_location))
+
+# Chlamydia
+disp_chlamydia <- betadisper(bray_cc, meta_cc$Chlamydia)
+cat("\n=== Betadisper (Chlamydia) ===\n"); print(anova(disp_chlamydia))
+```
+
+```{r}
+# Apply a multiple-testing correction to the 7 marginal p-values
+# (7 terms tested in one model -> adjust to guard against a chance significant result)
+pvals <- Mv_permanova$`Pr(>F)`[1:7]   # the 7 term p-values (excludes Residual/Total rows)
+names(pvals) <- rownames(Mv_permanova)[1:7]
+cat("\n=== Raw vs adjusted p-values ===\n")
+print(data.frame(
+  raw      = round(pvals, 3),
+  BH_FDR   = round(p.adjust(pvals, method = "BH"), 3),       # Benjamini-Hochberg (less strict)
+  Bonferroni = round(p.adjust(pvals, method = "bonferroni"), 3)  # Bonferroni (strict)
+))
+```
+
+```{r}
+# Which location(s) are more dispersed?
+print(tapply(disp_location$distances, meta_cc$Location_group, mean))
+```
+
+#### Checking Chlamydia findings
+
+```{r}
+# How many samples in each Chlamydia category? (small categories = less stable result)
+cat("\n=== Chlamydia category counts ===\n")
+print(table(meta_cc$Chlamydia))
+```
+```{r}
+# Recode Chlamydia to a balanced two-level factor: 0 = Negative, 1/2/3 = Positive
+meta_cc$Chlamydia_binary <- factor(ifelse(meta_cc$Chlamydia == "0", "Negative", "Positive"),
+                                   levels = c("Negative", "Positive"))
+
+# Check the new balance
+cat("\n=== Chlamydia binary counts ===\n")
+print(table(meta_cc$Chlamydia_binary))
+
+# Re-run the multivariate PERMANOVA with the binary chlamydia term
+set.seed(123)
+Mv_permanova_binary <- adonis2(
+  bray_cc ~ Integron_group + Location_group + Sex + BCS + Age + Weight + Chlamydia_binary,
+  data = meta_cc, permutations = 999, by = "margin")
+print(Mv_permanova_binary)
+
+# Betadisper for the binary chlamydia
+disp_chlamydia_bin <- betadisper(bray_cc, meta_cc$Chlamydia_binary)
+cat("\n=== Betadisper (Chlamydia binary) ===\n"); print(anova(disp_chlamydia_bin))
+```
+
+## Differential Abundance Analysis (Deseq2)
+
+```{r}
+library("DESeq2")
+
+# DESeq2 on RAW counts (ps_corrected), not rarefied — DESeq2 does its own normalisation
+diagdds <- phyloseq_to_deseq2(ps_corrected, ~ Integron_group)
+diagdds <- DESeq(diagdds, test = "Wald", fitType = "parametric", sfType = "poscounts")
+res <- results(diagdds, cooksCutoff = FALSE)
+
+# How many significant at padj < 0.05?
+cat("Significant taxa (padj < 0.05):", sum(res$padj < 0.05, na.rm = TRUE), "\n")
+```
+
+## Akkermansia Analysis
+
+```{r}
+library(phyloseq)
+library(vegan)
+library(dplyr)
+
+# Calculate Akkermansia relative abundance (%) per sample
+akk_subset      <- subset_taxa(ps_rarefied, Genus == "Akkermansia")
+akk_abundance   <- sample_sums(akk_subset)
+total_abundance <- sample_sums(ps_rarefied)
+
+metadata_akk <- data.frame(sample_data(ps_rarefied))
+metadata_akk$Sample          <- rownames(metadata_akk)
+metadata_akk$Akkermansia_pct <- (akk_abundance / total_abundance) * 100
+
+# Bray-Curtis distance (used by PERMANOVA + PCoA below)
+bray_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+
+cat("Mean Akkermansia %:", round(mean(metadata_akk$Akkermansia_pct), 2), "\n")
+print(summary(metadata_akk$Akkermansia_pct))
+```
+
+```{r}
+library(FSA)
+
+# --- Akkermansia by location (Kruskal-Wallis + Dunn's post-hoc) ---
+metadata_location <- metadata_akk[!is.na(metadata_akk$Location_group), ]
+metadata_location$Location_group <- factor(metadata_location$Location_group)
+
+# Summary by location
+akk_loc <- aggregate(Akkermansia_pct ~ Location_group, data = metadata_location,
+                     FUN = function(x) c(n = length(x), mean = mean(x), median = median(x), sd = sd(x)))
+print(akk_loc)
+
+kruskal_result <- kruskal.test(Akkermansia_pct ~ Location_group, data = metadata_location)
+cat("\nKruskal-Wallis: H =", round(kruskal_result$statistic, 3),
+    ", p =", round(kruskal_result$p.value, 4), "\n")
+
+if (kruskal_result$p.value < 0.05) {
+  cat("\nDunn's test (Bonferroni):\n")
+  print(dunnTest(Akkermansia_pct ~ Location_group, data = metadata_location, method = "bonferroni"))
+}
+
+# --- PERMANOVA: continuous Akkermansia vs community composition ---
+set.seed(123)
+permanova_akk <- adonis2(bray_dist ~ Akkermansia_pct, data = metadata_akk, permutations = 999)
+cat("\nPERMANOVA (Akkermansia_pct):\n")
+print(permanova_akk)
+
+# --- Correlation of Akkermansia with PCoA axes ---
+pcoa_akk <- ordinate(ps_rarefied, method = "PCoA", distance = bray_dist)
+pc_scores <- pcoa_akk$vectors[, 1:2]
+matched <- match(rownames(pc_scores), metadata_akk$Sample)
+cor_pc1 <- cor.test(metadata_akk$Akkermansia_pct[matched], pc_scores[, 1], method = "spearman", exact = FALSE)
+cor_pc2 <- cor.test(metadata_akk$Akkermansia_pct[matched], pc_scores[, 2], method = "spearman", exact = FALSE)
+cat("\nPC1 vs Akkermansia: rho =", round(cor_pc1$estimate, 3), ", p =", format(cor_pc1$p.value, scientific = TRUE), "\n")
+cat("PC2 vs Akkermansia: rho =", round(cor_pc2$estimate, 3), ", p =", format(cor_pc2$p.value, scientific = TRUE), "\n")
+```
+
+```{r}
+library(ggplot2); library(patchwork); library(viridis)
+
+# Panel A: Akkermansia by location
+metadata_location <- metadata_akk[!is.na(metadata_akk$Location_group), ]
+panel_a <- ggplot(metadata_location,
+                  aes(x = as.factor(Location_group), y = Akkermansia_pct, fill = as.factor(Location_group))) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  scale_fill_manual(values = c("1" = "#E69F00", "2" = "#56B4E9", "3" = "#009E73")) +
+  labs(x = "Location", y = "Akkermansia (%)") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(color = "black", linewidth = 0.5),
+        axis.text = element_text(color = "black", size = 14),
+        axis.title = element_text(color = "black", size = 14, face = "bold"),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5))
+
+# Panel B: PCoA coloured by Akkermansia
+pcoa_akk <- ordinate(ps_rarefied, method = "PCoA", distance = bray_dist)
+pcoa_df <- plot_ordination(ps_rarefied, pcoa_akk, justDF = TRUE)
+pcoa_df$Akkermansia_pct <- metadata_akk$Akkermansia_pct[match(rownames(pcoa_df), metadata_akk$Sample)]
+eig <- pcoa_akk$values$Eigenvalues
+var_exp <- round(100 * eig / sum(eig), 1)
+
+panel_b <- ggplot(pcoa_df, aes(x = Axis.1, y = Axis.2, color = Akkermansia_pct)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_viridis_c(name = "Akkermansia (%)", option = "plasma", end = 0.9) +
+  labs(x = paste0("PC1 (", var_exp[1], "%)"), y = paste0("PC2 (", var_exp[2], "%)")) +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.line = element_line(color = "black", linewidth = 0.5),
+        axis.text = element_text(color = "black", size = 14),
+        axis.title = element_text(color = "black", size = 14, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 14),
+        panel.border = element_rect(color = "black", fill = NA, linewidth = 0.5))
+
+combined_figure <- panel_a + panel_b + plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+print(combined_figure)
+
+ggsave("Figure_Akkermansia_Combined.png", combined_figure, width = 12, height = 5, dpi = 300, bg = "white")
+ggsave("Figure_Akkermansia_Combined.pdf", combined_figure, width = 12, height = 5)
+ggsave("Figure_Akkermansia_Combined.tiff", combined_figure, width = 12, height = 5, dpi = 300, compression = "lzw")
+```
+
+
+### Akkermansia vs host/environmental factor
+
+```{r}
+df <- metadata_akk
+
+# Binary chlamydia from Chlamydia.UGT (0 = Negative, 1-3 = Positive)
+ugt_numeric <- suppressWarnings(as.numeric(as.character(df$Chlamydia.UGT)))
+df$Chlamydia_binary <- factor(ifelse(is.na(ugt_numeric), NA,
+                              ifelse(ugt_numeric == 0, "Negative", "Positive")),
+                              levels = c("Negative", "Positive"))
+
+# BCS as ordinal (Emaciated < Poor < Fair < Good < Excellent -> 1-5)
+bcs_levels <- c("Emaciated", "Poor", "Fair", "Good", "Excellent")
+df$BCS_ord <- as.numeric(factor(df$BCS, levels = bcs_levels, ordered = TRUE))
+
+# Weight numeric
+df$Weight_num <- suppressWarnings(as.numeric(as.character(df$Animal.Weight..Kg.)))
+
+cat("Binary chlamydia split:\n"); print(table(df$Chlamydia_binary)); cat("\n")
+
+cat("=== Akkermansia vs host/environmental factors ===\n")
+
+w_int <- wilcox.test(Akkermansia_pct ~ factor(Integron_group), data = df)
+cat("Integron (Wilcoxon):  W =", w_int$statistic, ", p =", round(w_int$p.value, 4), "\n")
+
+k_sex <- kruskal.test(Akkermansia_pct ~ factor(Sex), data = df)
+cat("Sex (Kruskal-Wallis): H =", round(k_sex$statistic, 3), ", p =", round(k_sex$p.value, 4), "\n")
+
+k_age <- kruskal.test(Akkermansia_pct ~ factor(TWC...Estimated.age), data = df)
+cat("Age (Kruskal-Wallis): H =", round(k_age$statistic, 3), ", p =", round(k_age$p.value, 4), "\n")
+
+s_bcs <- cor.test(df$Akkermansia_pct, df$BCS_ord, method = "spearman", exact = FALSE)
+cat("BCS (Spearman, ordinal): rho =", round(s_bcs$estimate, 3), ", p =", round(s_bcs$p.value, 4), "\n")
+
+s_wt <- cor.test(df$Akkermansia_pct, df$Weight_num, method = "spearman", exact = FALSE)
+cat("Weight (Spearman): rho =", round(s_wt$estimate, 3), ", p =", round(s_wt$p.value, 4), "\n")
+
+w_chl <- wilcox.test(Akkermansia_pct ~ Chlamydia_binary, data = df)
+cat("Chlamydia (Wilcoxon, binary): W =", w_chl$statistic, ", p =", round(w_chl$p.value, 4), "\n")
+```
+
+```{r}
+# Elevated Akkermansia (>10%) by integron group 
+
+df$Akk_elevated <- df$Akkermansia_pct > 10
+elev_tab <- table(df$Integron_group, df$Akk_elevated)
+
+cat("Counts (>10% = TRUE):\n"); print(elev_tab)
+cat("\nProportion >10% within each group (%):\n")
+print(round(prop.table(elev_tab, margin = 1) * 100, 1))
+
+chi_elev <- suppressWarnings(chisq.test(elev_tab))
+cat("\nChi-square: X-squared =", round(chi_elev$statistic, 4), ", p =", round(chi_elev$p.value, 4), "\n")
+cat("Fisher's exact: p =", round(fisher.test(elev_tab)$p.value, 4), "\n")
+```
+
+
+## Location analysis
+
+```{r}
+library(vegan); library(phyloseq)
+
+# Build location distance + metadata (self-contained)
+bray_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+metadata  <- as(sample_data(ps_rarefied), "data.frame")
+
+# Drop the NA-location sample, factor location
+metadata_location <- metadata[!is.na(metadata$Location_group), ]
+metadata_location$Location_group <- factor(metadata_location$Location_group)
+keep <- rownames(metadata_location)
+bray_dist_location <- as.dist(as.matrix(bray_dist)[keep, keep])
+
+# Sample indices for each location
+loc1_samples <- which(metadata_location$Location_group == 1)
+loc2_samples <- which(metadata_location$Location_group == 2)
+loc3_samples <- which(metadata_location$Location_group == 3)
+
+# Function to run a pairwise PERMANOVA between two location groups
+pairwise_permanova <- function(dist_matrix, metadata, group1, group2, label) {
+  samples  <- c(group1, group2)
+  dist_sub <- as.dist(as.matrix(dist_matrix)[samples, samples])
+  meta_sub <- metadata[samples, ]
+  set.seed(123)
+  result <- adonis2(dist_sub ~ Location_group, data = meta_sub, permutations = 999)
+  cat(label, "\n")
+  cat("  R² =", round(result$R2[1], 4), ", F =", round(result$F[1], 3),
+      ", p =", result$`Pr(>F)`[1], "\n\n")
+  return(result)
+}
+
+cat("=== PAIRWISE PERMANOVA COMPARISONS ===\n")
+pair_1v2 <- pairwise_permanova(bray_dist_location, metadata_location, loc1_samples, loc2_samples, "Location 1 vs 2:")
+pair_1v3 <- pairwise_permanova(bray_dist_location, metadata_location, loc1_samples, loc3_samples, "Location 1 vs 3:")
+pair_2v3 <- pairwise_permanova(bray_dist_location, metadata_location, loc2_samples, loc3_samples, "Location 2 vs 3:")
+
+adjusted_alpha <- 0.05 / 3
+
+pairwise_summary <- data.frame(
+  Comparison  = c("Location 1 vs 2", "Location 1 vs 3", "Location 2 vs 3"),
+  R2          = c(pair_1v2$R2[1], pair_1v3$R2[1], pair_2v3$R2[1]),
+  F_value     = c(pair_1v2$F[1],  pair_1v3$F[1],  pair_2v3$F[1]),
+  p_value     = c(pair_1v2$`Pr(>F)`[1], pair_1v3$`Pr(>F)`[1], pair_2v3$`Pr(>F)`[1]),
+  Significant = c(
+    ifelse(pair_1v2$`Pr(>F)`[1] < adjusted_alpha, "YES", "NO"),
+    ifelse(pair_1v3$`Pr(>F)`[1] < adjusted_alpha, "YES", "NO"),
+    ifelse(pair_2v3$`Pr(>F)`[1] < adjusted_alpha, "YES", "NO")
+  )
+)
+
+cat("=== SUMMARY (Bonferroni adjusted alpha =", round(adjusted_alpha, 4), ") ===\n")
+print(pairwise_summary, row.names = FALSE)
+```
+
+```{r}
+library(vegan); library(phyloseq); library(ggplot2)
+
+# Build location distance + metadata (self-contained)
+bray_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+metadata  <- as(sample_data(ps_rarefied), "data.frame")
+metadata_location <- metadata[!is.na(metadata$Location_group), ]
+metadata_location$Location_group <- factor(metadata_location$Location_group)
+metadata_location$Sample <- rownames(metadata_location)
+keep <- rownames(metadata_location)
+bray_dist_location <- as.dist(as.matrix(bray_dist)[keep, keep])
+
+# PERMANOVA (for annotation values)
+set.seed(123)
+permanova_location <- adonis2(bray_dist_location ~ Location_group, data = metadata_location, permutations = 999)
+
+# NMDS on the location distance matrix
+set.seed(123)
+nmds_location <- metaMDS(bray_dist_location, k = 2, trymax = 100)
+cat("NMDS stress:", round(nmds_location$stress, 3), "\n")
+
+# Extract scores and attach location group (row order matches the distance matrix)
+nmds_scores <- as.data.frame(scores(nmds_location))
+nmds_scores$Location_group <- metadata_location$Location_group
+
+# Plot (Fig. 6)
+location_colors <- c("1" = "#E69F00", "2" = "#56B4E9", "3" = "#009E73")
+
+nmds_plot <- ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2,
+                                     color = Location_group, fill = Location_group)) +
+  stat_ellipse(geom = "polygon", level = 0.95, alpha = 0.2, linewidth = 1) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = location_colors, name = "Location",
+                     labels = c("Location 1", "Location 2", "Location 3")) +
+  scale_fill_manual(values = location_colors, name = "Location",
+                    labels = c("Location 1", "Location 2", "Location 3")) +
+  labs(x = "NMDS1", y = "NMDS2") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 1),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    legend.background = element_rect(fill = "white", color = "black"),
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 12),
+    axis.title = element_text(face = "bold", size = 14),
+    axis.text = element_text(size = 12, color = "black"),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black")
+  )
+print(nmds_plot)
+
+ggsave("Figure_NMDS_Location.png", nmds_plot, width = 8, height = 6, dpi = 300, bg = "white")
+ggsave("Figure_NMDS_Location.pdf", nmds_plot, width = 8, height = 6)
+ggsave("Figure_NMDS_Location.tiff", nmds_plot, width = 8, height = 6, dpi = 300, compression = "lzw")
+```
+
+```{r}
+print(pairwise_summary, row.names = FALSE)
+```
+
+### Differential abundance with location
+
+
+```{r}
+library(phyloseq); library(DESeq2); library(dplyr)
+
+# Use UNRAREFIED data (ps_corrected)
+ps_location <- subset_samples(ps_corrected, !is.na(Location_group))
+sample_data(ps_location)$Location_group <- as.factor(sample_data(ps_location)$Location_group)
+cat("Samples with location data:", nsamples(ps_location), "\n")
+
+tax_table_df <- as.data.frame(tax_table(ps_location))
+tax_table_df$ASV <- rownames(tax_table_df)
+
+# Helper: pairwise DESeq2 using prune_samples (avoids subset_samples scoping issue)
+run_deseq_location <- function(g1, g2) {
+  grp <- as.character(sample_data(ps_location)$Location_group)
+  keep_samples <- sample_names(ps_location)[grp %in% c(g1, g2)]
+  ps_sub <- prune_samples(keep_samples, ps_location)
+  sample_data(ps_sub)$Location_group <- factor(sample_data(ps_sub)$Location_group)
+
+  dds <- phyloseq_to_deseq2(ps_sub, ~ Location_group)
+  dds <- DESeq(dds, test = "Wald", fitType = "parametric", sfType = "poscounts")
+  res <- results(dds, contrast = c("Location_group", g1, g2), alpha = 0.05)
+  res_df <- as.data.frame(res); res_df$ASV <- rownames(res_df)
+  res_df <- merge(res_df, tax_table_df, by = "ASV")
+  res_df %>% filter(padj < 0.05) %>% arrange(padj)
+}
+
+sig_1v2 <- run_deseq_location("1", "2")
+sig_1v3 <- run_deseq_location("1", "3")
+sig_2v3 <- run_deseq_location("2", "3")
+
+cat("\n=== SIGNIFICANT TAXA ===\n")
+cat("Location 1 vs 2:", nrow(sig_1v2), "\n")
+cat("Location 1 vs 3:", nrow(sig_1v3), "\n")
+cat("Location 2 vs 3:", nrow(sig_2v3), "\n")
+
+# Enriched in Location 1 (positive log2FC) — matches "enriched in Location 1" wording
+cat("\nEnriched in Location 1 (positive log2FC):\n")
+cat("  vs Location 2:", sum(sig_1v2$log2FoldChange > 0), "\n")
+cat("  vs Location 3:", sum(sig_1v3$log2FoldChange > 0), "\n")
+
+# Muribaculaceae log2FC range
+cat("\nMuribaculaceae log2FC (1 vs 2):\n")
+print(sig_1v2[grepl("Muribaculaceae", sig_1v2$Family), c("Genus","Family","log2FoldChange","padj")])
+cat("\nMuribaculaceae log2FC (1 vs 3):\n")
+print(sig_1v3[grepl("Muribaculaceae", sig_1v3$Family), c("Genus","Family","log2FoldChange","padj")])
+
+write.csv(sig_1v2, "DESeq2_Location1vs2_significant.csv", row.names = FALSE)
+write.csv(sig_1v3, "DESeq2_Location1vs3_significant.csv", row.names = FALSE)
+write.csv(sig_2v3, "DESeq2_Location2vs3_significant.csv", row.names = FALSE)
+```
+
+```{r}
+# Confirm counts and Muribaculaceae fold-change range for 4.5.1
+cat("Loc1 vs Loc2: total sig =", nrow(sig_1v2),
+    "| enriched in Loc1 =", sum(sig_1v2$log2FoldChange > 0), "\n")
+cat("Loc1 vs Loc3: total sig =", nrow(sig_1v3),
+    "| enriched in Loc1 =", sum(sig_1v3$log2FoldChange > 0), "\n")
+cat("Loc2 vs Loc3: total sig =", nrow(sig_2v3), "\n\n")
+
+# Muribaculaceae log2FC range across both Location-1 comparisons
+muri_fc <- c(sig_1v2$log2FoldChange[grepl("Muribaculaceae", sig_1v2$Family)],
+             sig_1v3$log2FoldChange[grepl("Muribaculaceae", sig_1v3$Family)])
+cat("Muribaculaceae log2FC range:", round(min(muri_fc), 1), "to", round(max(muri_fc), 1), "\n")
+```
+
+
+## Creating Map with Koala coordinates
+
+```{r}
+library(sf)
+library(ggplot2)
+library(ggspatial)
+library(osmdata)
+library(dplyr)
+
+# Read koala coordinates and convert to spatial points
+koalas <- read_csv("Location_coords_koalaBNP.csv")
+koalas <- koalas[complete.cases(koalas[, c("lat", "lon")]), ]
+koalas_sf <- st_as_sf(koalas, coords = c("lon", "lat"), crs = 4326)
+
+# Pull OpenStreetMap features for Belair (returns NULL on failure, layers skip gracefully)
+belair_bbox <- c(left = 138.62, bottom = -35.04, right = 138.68, top = -34.98)
+get_osm <- function(key, value = NULL) {
+  tryCatch({
+    q <- opq(bbox = belair_bbox) %>% add_osm_feature(key = key, value = value)
+    res <- osmdata_sf(q)
+    if (key == "highway" || key == "railway") res$osm_lines else res$osm_polygons
+  }, error = function(e) NULL)
+}
+park_areas        <- get_osm("leisure", c("nature_reserve", "park"))
+forest_areas      <- get_osm("natural", c("wood", "scrub"))
+residential_areas <- get_osm("landuse", "residential")
+all_roads         <- get_osm("highway")
+railway_line      <- get_osm("railway")
+
+# Build location hulls + centroids (for the n = labels)
+location_hulls <- koalas_sf %>%
+  group_by(Location_group) %>%
+  dplyr::summarise(n_koalas = dplyr::n(), .groups = "drop") %>%
+  st_convex_hull()
+location_hulls_buffered <- st_buffer(location_hulls, dist = 0.001)
+location_centroids <- suppressWarnings(st_centroid(location_hulls))
+
+location_colors <- c("1" = "#E69F00", "2" = "#56B4E9", "3" = "#009E73")
+
+# Build map
+map_final <- ggplot() +
+  {if (!is.null(park_areas))        geom_sf(data = park_areas,        fill = "#E8F5E9", color = NA, alpha = 0.8)} +
+  {if (!is.null(forest_areas))      geom_sf(data = forest_areas,      fill = "#C8E6C9", color = NA, alpha = 0.7)} +
+  {if (!is.null(residential_areas)) geom_sf(data = residential_areas, fill = "#F5F5F5", color = NA, alpha = 0.9)} +
+  {if (!is.null(all_roads))         geom_sf(data = all_roads,         color = "gray80", linewidth = 0.4)} +
+  geom_sf(data = location_hulls_buffered, aes(fill = as.factor(Location_group)), alpha = 0.2, color = NA) +
+  geom_sf(data = location_hulls_buffered, aes(color = as.factor(Location_group)), fill = NA, linewidth = 3) +
+  {if (!is.null(railway_line)) geom_sf(data = railway_line, aes(linetype = "Railway line"), color = "black", linewidth = 1)} +
+  geom_sf(data = koalas_sf, aes(fill = as.factor(Location_group)),
+          shape = 21, size = 3, color = "white", stroke = 1) +
+  geom_sf_text(data = location_centroids, aes(label = paste0("n = ", n_koalas)),
+               size = 5, fontface = "bold", color = "black") +
+  scale_fill_manual(values = location_colors, name = "Location",
+                    labels = c("Location 1", "Location 2", "Location 3")) +
+  scale_color_manual(values = location_colors, name = "Location",
+                     labels = c("Location 1", "Location 2", "Location 3")) +
+  scale_linetype_manual(name = "Infrastructure", values = c("Railway line" = "solid"),
+                        guide = guide_legend(override.aes = list(color = "black", linewidth = 2))) +
+  annotation_scale(location = "bl", width_hint = 0.25, style = "ticks",
+                   line_width = 1.2, text_cex = 1.2,
+                   pad_x = unit(0.8, "cm"), pad_y = unit(0.8, "cm")) +
+  annotation_north_arrow(location = "tl", which_north = "true",
+                         pad_x = unit(0.8, "cm"), pad_y = unit(0.8, "cm"),
+                         style = north_arrow_fancy_orienteering(line_width = 1.2, text_size = 14),
+                         height = unit(1.8, "cm"), width = unit(1.8, "cm")) +
+  labs(x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  theme(
+    panel.background = element_rect(fill = "white", color = "black", linewidth = 1.5),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 14),
+    legend.text = element_text(size = 14),
+    legend.key.size = unit(1, "cm"),
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    plot.margin = margin(15, 15, 15, 15)
+  )
+print(map_final)
+
+ggsave("Figure_Belair_Final_Map.png", map_final, width = 11, height = 8, dpi = 300, bg = "white")
+ggsave("Figure_Belair_Final_Map.pdf", map_final, width = 11, height = 8)
+```
+## Beta Diversity - NMDS Bray-Curtis, Weighted and Unweighted UniFrac (Rarefied Data)
+
+```{r}
+library(phyloseq)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+
+# ── NMDS BRAY-CURTIS (Panel a) ────────────────────────────────────────────────
+
+sample_data_df <- as.data.frame(sample_data(ps_rarefied), check.names = FALSE)
+reads <- as.matrix(t(otu_table(ps_rarefied)))
+
+env_for_fit <- data.frame(
+  Sex = factor(sample_data_df[["Sex"]]),
+  BCS = factor(sample_data_df[["BCS"]]),
+  Integron_group = factor(sample_data_df[["Integron_group"]]),
+  stringsAsFactors = FALSE,
+  row.names = rownames(sample_data_df)
+)
+
+cat("Running NMDS ordination on rarefied data...\n")
+set.seed(123)
+ord <- metaMDS(reads, distance = "bray", k = 2, trymax = 50)
+
+cat("\nNMDS stress:", round(ord$stress, 3), "\n")
+if(ord$stress < 0.05) {
+  cat("Excellent representation (stress < 0.05)\n")
+} else if(ord$stress < 0.1) {
+  cat("Good representation (stress < 0.1)\n")
+} else if(ord$stress < 0.2) {
+  cat("Fair representation (stress < 0.2)\n")
+} else {
+  cat("Poor representation (stress > 0.2)\n")
+}
+
+bray_dist <- vegdist(reads, method = "bray")
+set.seed(123)
+permanova_bray <- adonis2(bray_dist ~ Integron_group,
+                          data = env_for_fit,
+                          permutations = 999)
+cat("\n=== PERMANOVA on Bray-Curtis ===\n")
+print(permanova_bray)
+
+disp_bray <- betadisper(bray_dist, env_for_fit$Integron_group)
+cat("\n=== Betadisper (Bray-Curtis) ===\n")
+print(anova(disp_bray))
+
+plot_data <- data.frame(
+  NMDS1 = as.numeric(ord$points[, 1]),
+  NMDS2 = as.numeric(ord$points[, 2]),
+  Integron_group = factor(env_for_fit$Integron_group),
+  Sex = factor(env_for_fit$Sex),
+  BCS = factor(env_for_fit$BCS)
+)
+
+p_nmds <- ggplot(plot_data, aes(x = NMDS1, y = NMDS2, color = Integron_group)) +
+  geom_point(size = 4, shape = 16) +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2,
+               linewidth = 0.8, show.legend = FALSE) +
+  labs(
+    x = "NMDS1",
+    y = "NMDS2",
+    color = "Integron Group",
+    title = NULL
+  ) +
+  annotate("text", x = Inf, y = -Inf,
+           label = paste("Stress =", round(ord$stress, 3)),
+           hjust = 1.1, vjust = -0.5, size = 4, fontface = "italic") +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_color_brewer(palette = "Set2")
+
+# ── WEIGHTED UNIFRAC PCoA (Panel b) ──────────────────────────────────────────
+
+weighted <- UniFrac(ps_rarefied, weighted = TRUE, normalized = TRUE,
+                    parallel = FALSE, fast = TRUE)
+pcoa_weighted <- ordinate(ps_rarefied, "PCoA", "weighted")
+
+eig_weighted <- pcoa_weighted$values$Eigenvalues
+var_weighted <- round(eig_weighted / sum(eig_weighted) * 100, 1)
+
+p_weighted <- plot_ordination(ps_rarefied, pcoa_weighted, color = "Integron_group") +
+  geom_point(size = 4, shape = 16) +
+  labs(
+    x = paste0("PCoA 1 (", var_weighted[1], "%)"),
+    y = paste0("PCoA 2 (", var_weighted[2], "%)"),
+    color = "Integron Group",
+    title = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2,
+               linewidth = 0.8, show.legend = FALSE)
+
+# ── UNWEIGHTED UNIFRAC PCoA (Panel c) ────────────────────────────────────────
+
+unweighted <- UniFrac(ps_rarefied, weighted = FALSE, normalized = TRUE,
+                      parallel = FALSE, fast = TRUE)
+pcoa_unweighted <- ordinate(ps_rarefied, "PCoA", "unweighted")
+
+eig_unweighted <- pcoa_unweighted$values$Eigenvalues
+var_unweighted <- round(eig_unweighted / sum(eig_unweighted) * 100, 1)
+
+p_unweighted <- plot_ordination(ps_rarefied, pcoa_unweighted, color = "Integron_group") +
+  geom_point(size = 4, shape = 16) +
+  labs(
+    x = paste0("PCoA 1 (", var_unweighted[1], "%)"),
+    y = paste0("PCoA 2 (", var_unweighted[2], "%)"),
+    color = "Integron Group",
+    title = NULL
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 14, face = "bold"),
+    axis.text = element_text(size = 14, color = "black"),
+    legend.title = element_text(size = 14, face = "bold"),
+    legend.text = element_text(size = 14),
+    legend.position = "bottom",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(color = "black", linewidth = 1),
+    plot.margin = margin(5, 5, 5, 5)
+  ) +
+  scale_color_brewer(palette = "Set2") +
+  stat_ellipse(aes(color = Integron_group), type = "t", linetype = 2,
+               linewidth = 0.8, show.legend = FALSE)
+
+# ── COMBINE INTO SINGLE FIGURE ────────────────────────────────────────────────
+
+p_nmds_no_legend <- p_nmds + theme(legend.position = "none")
+p_weighted_no_legend <- p_weighted + theme(legend.position = "none")
+
+final_plot <- (p_nmds_no_legend / p_weighted_no_legend / p_unweighted) +
+  plot_annotation(tag_levels = 'a') &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+
+print(final_plot)
+
+ggsave(
+  "beta_diversity_combined.png",
+  plot = final_plot,
+  width = 8,
+  height = 11,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  "beta_diversity_combined.pdf",
+  plot = final_plot,
+  width = 8,
+  height = 11
+)
+
+ggsave(
+  "beta_diversity_combined.tiff",
+  plot = final_plot,
+  width = 8,
+  height = 11,
+  dpi = 300,
+  compression = "lzw"
+)
+
+cat("✓ Combined beta diversity figure saved!\n")
+cat("✓ Panel (a): NMDS Bray-Curtis\n")
+cat("✓ Panel (b): Weighted UniFrac PCoA\n")
+cat("✓ Panel (c): Unweighted UniFrac PCoA\n")
+cat("✓ Single legend on panel (c)\n")
+cat("✓ Formats: PNG, PDF, TIFF\n")
+```
+
+
+## Re-extracted Sample
+
+10 fecal samples were re-extracted for DNA due to low yield or volume. The below analysis is to check that this did not have any confounding effects on our results. 
+
+```{r}
+# Load required packages
+if(!require(vegan)) library(vegan)
+```
+
+```{r}
+# COMPARING RE-EXTRACTED SAMPLES VS ORIGINAL EXTRACTION SAMPLES
+
+# Define re-extracted samples
+reextracted_samples <- c("BNP-009-POW15295A5", "BNP-017-POW15295A11", 
+                         "BNP-044-POW15295A27", "BNP-052-POW15295A33", 
+                         "BNP-053-POW15295A34", "BNP-055-POW15295A35", 
+                         "BNP-060-POW15295A38", "BNP-069-POW15295A43", 
+                         "BNP-075-POW15295A48", "BNP-095-POW15295A59")
+
+# Add extraction status to your phyloseq object
+sample_data(ps_rarefied)$extraction_status <- ifelse(
+  sample_names(ps_rarefied) %in% reextracted_samples,
+  "Re-extracted",
+  "Original"
+)
+
+# Verify the assignment
+cat("Total samples:", nsamples(ps_rarefied), "\n")
+cat("Re-extracted samples:", sum(sample_data(ps_rarefied)$extraction_status == "Re-extracted"), "\n")
+cat("Original samples:", sum(sample_data(ps_rarefied)$extraction_status == "Original"), "\n\n")
+```
+
+```{r}
+# Alpha Diversity
+
+alpha_div <- estimate_richness(ps_rarefied, measures = c("Observed", "Shannon", "Simpson"))
+alpha_div$extraction_status <- sample_data(ps_rarefied)$extraction_status
+
+# Wilcoxon tests
+wilcox_obs <- wilcox.test(Observed ~ extraction_status, data = alpha_div)
+wilcox_shan <- wilcox.test(Shannon ~ extraction_status, data = alpha_div)
+wilcox_simp <- wilcox.test(Simpson ~ extraction_status, data = alpha_div)
+
+cat("\nObserved Richness:\n")
+cat("  p-value =", round(wilcox_obs$p.value, 4), "\n")
+cat("  Re-extracted mean:", round(mean(alpha_div$Observed[alpha_div$extraction_status == "Re-extracted"]), 1), "\n")
+cat("  Original mean:", round(mean(alpha_div$Observed[alpha_div$extraction_status == "Original"]), 1), "\n")
+
+cat("\nShannon Diversity:\n")
+cat("  p-value =", round(wilcox_shan$p.value, 4), "\n")
+cat("  Re-extracted mean:", round(mean(alpha_div$Shannon[alpha_div$extraction_status == "Re-extracted"]), 3), "\n")
+cat("  Original mean:", round(mean(alpha_div$Shannon[alpha_div$extraction_status == "Original"]), 3), "\n")
+
+cat("\nSimpson Diversity:\n")
+cat("  p-value =", round(wilcox_simp$p.value, 4), "\n")
+cat("  Re-extracted mean:", round(mean(alpha_div$Simpson[alpha_div$extraction_status == "Re-extracted"]), 3), "\n")
+cat("  Original mean:", round(mean(alpha_div$Simpson[alpha_div$extraction_status == "Original"]), 3), "\n\n")
+
+# Plot
+alpha_long <- alpha_div %>%
+  tibble::rownames_to_column("Sample") %>%
+  select(Sample, extraction_status, Observed, Shannon, Simpson) %>%
+  pivot_longer(cols = c(Observed, Shannon, Simpson), 
+               names_to = "metric", 
+               values_to = "value")
+
+p_alpha <- ggplot(alpha_long, aes(x = extraction_status, y = value, fill = extraction_status)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  theme_bw(base_size = 12) +
+  labs(title = "Alpha Diversity: Re-extracted vs Original Samples",
+       x = "Extraction Status",
+       y = "Value") +
+  scale_fill_manual(values = c("Re-extracted" = "#E69F00", "Original" = "#56B4E9")) +
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "white"))
+
+print(p_alpha)
+ggsave("reextraction_alpha_diversity.png", p_alpha, width = 12, height = 4, dpi = 300)
+```
+
+
+```{r}
+# BETA DIVERSITY COMPARISON
+
+# Calculate Bray-Curtis distances
+bc_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+
+# PERMANOVA
+set.seed(123)
+permanova_result <- adonis2(bc_dist ~ extraction_status, 
+                            data = data.frame(sample_data(ps_rarefied)), 
+                            permutations = 999)
+
+cat("\nPERMANOVA Results:\n")
+cat("  R² =", round(permanova_result$R2[1], 4), "\n")
+cat("  p-value =", round(permanova_result$`Pr(>F)`[1], 4), "\n")
+
+# Test for homogeneity of dispersion
+bd <- betadisper(bc_dist, sample_data(ps_rarefied)$extraction_status)
+bd_test <- permutest(bd, permutations = 999)
+
+cat("\nBetadisper (dispersion test):\n")
+cat("  p-value =", round(bd_test$tab$`Pr(>F)`[1], 4), "\n\n")
+
+# NMDS plot
+set.seed(123)
+nmds <- ordinate(ps_rarefied, method = "NMDS", distance = "bray")
+
+nmds_df <- data.frame(
+  NMDS1 = scores(nmds)$sites[,1],
+  NMDS2 = scores(nmds)$sites[,2],
+  extraction_status = sample_data(ps_rarefied)$extraction_status,
+  integron_group = sample_data(ps_rarefied)$Integron_group
+)
+
+p_nmds <- ggplot(nmds_df, aes(x = NMDS1, y = NMDS2)) +
+  geom_point(aes(color = extraction_status, shape = integron_group), size = 3, alpha = 0.7) +
+  stat_ellipse(aes(group = extraction_status, color = extraction_status), level = 0.95) +
+  theme_bw(base_size = 12) +
+  labs(title = "NMDS Ordination: Re-extracted vs Original Samples",
+       subtitle = paste0("Stress: ", round(nmds$stress, 3), 
+                        " | PERMANOVA p = ", round(permanova_result$`Pr(>F)`[1], 4)),
+       color = "Extraction Status",
+       shape = "Integron Group") +
+  scale_color_manual(values = c("Re-extracted" = "#E69F00", "Original" = "#56B4E9")) +
+  theme(legend.position = "bottom")
+
+print(p_nmds)
+ggsave("reextraction_nmds.png", p_nmds, width = 8, height = 7, dpi = 300)
+```
+
+
+```{r}
+# PHYLUM-LEVEL COMPOSITION TEST
+
+# Get taxonomy table directly
+tax_df <- as.data.frame(tax_table(ps_rarefied))
+
+# Get OTU table as relative abundance
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x))
+otu_rel <- as.data.frame(t(otu_table(ps_rel)))
+
+# Add extraction status
+otu_rel$extraction_status <- sample_data(ps_rel)$extraction_status
+
+# For each phylum, sum up abundances
+phyla_in_data <- unique(tax_df$Phylum)
+phyla_in_data <- phyla_in_data[!is.na(phyla_in_data) & phyla_in_data != ""]
+
+cat("\nPhyla found in dataset:", length(phyla_in_data), "\n")
+
+# Calculate phylum abundances for each sample
+phylum_results <- data.frame()
+
+for(phylum in phyla_in_data) {
+  # Get ASVs belonging to this phylum
+  asvs_in_phylum <- rownames(tax_df)[tax_df$Phylum == phylum & !is.na(tax_df$Phylum)]
+  
+  if(length(asvs_in_phylum) > 0) {
+    # Sum abundances for this phylum in each sample
+    phylum_abundance <- rowSums(otu_rel[, asvs_in_phylum, drop = FALSE])
+    
+    temp_df <- data.frame(
+      Sample = rownames(otu_rel),
+      Phylum = phylum,
+      Abundance = phylum_abundance,
+      extraction_status = otu_rel$extraction_status
+    )
+    
+    phylum_results <- rbind(phylum_results, temp_df)
+  }
+}
+
+# Find major phyla (>1% mean abundance)
+major_phyla_df <- phylum_results %>%
+  group_by(Phylum) %>%
+  summarise(mean_ab = mean(Abundance), .groups = "drop") %>%
+  filter(mean_ab > 0.01) %>%
+  arrange(desc(mean_ab))
+
+cat("\nMajor phyla (>1% mean abundance):\n")
+print(major_phyla_df)
+
+cat("\nTesting for differences:\n")
+for(phylum in major_phyla_df$Phylum) {
+  phylum_data <- phylum_results %>%
+    filter(Phylum == phylum)
+  
+  test_result <- wilcox.test(Abundance ~ extraction_status, data = phylum_data)
+  
+  re_mean <- mean(phylum_data$Abundance[phylum_data$extraction_status == "Re-extracted"])
+  orig_mean <- mean(phylum_data$Abundance[phylum_data$extraction_status == "Original"])
+  
+  cat(sprintf("%-20s p = %.4f | Re-extracted: %.3f | Original: %.3f\n", 
+              phylum, test_result$p.value, re_mean, orig_mean))
+}
+```
+
+
+```{r}
+# FIRMICUTES:BACTEROIDETES RATIO
+
+# Get F and B abundances
+fb_data <- phylum_results %>%
+  filter(Phylum %in% c("Firmicutes", "Bacteroidota", "Bacteroidetes")) %>%
+  select(Sample, Phylum, Abundance, extraction_status) %>%
+  pivot_wider(names_from = Phylum, values_from = Abundance, values_fill = 0)
+
+# Handle different naming conventions
+if("Bacteroidota" %in% colnames(fb_data)) {
+  fb_data$FB_ratio <- fb_data$Firmicutes / fb_data$Bacteroidota
+  bacteroides_name <- "Bacteroidota"
+} else if("Bacteroidetes" %in% colnames(fb_data)) {
+  fb_data$FB_ratio <- fb_data$Firmicutes / fb_data$Bacteroidetes
+  bacteroides_name <- "Bacteroidetes"
+} else {
+  cat("Could not find Bacteroidetes/Bacteroidota in data\n")
+  bacteroides_name <- NULL
+}
+
+if(!is.null(bacteroides_name) && "FB_ratio" %in% colnames(fb_data)) {
+  # Remove infinite values
+  fb_data <- fb_data %>% filter(is.finite(FB_ratio))
+  
+  fb_test <- wilcox.test(FB_ratio ~ extraction_status, data = fb_data)
+  
+  cat("p-value =", round(fb_test$p.value, 4), "\n")
+  cat("Re-extracted mean:", round(mean(fb_data$FB_ratio[fb_data$extraction_status == "Re-extracted"], na.rm = TRUE), 3), "\n")
+  cat("Original mean:", round(mean(fb_data$FB_ratio[fb_data$extraction_status == "Original"], na.rm = TRUE), 3), "\n\n")
+  
+  # Plot
+  p_fb <- ggplot(fb_data, aes(x = extraction_status, y = FB_ratio, fill = extraction_status)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+    theme_bw(base_size = 12) +
+    labs(title = "Firmicutes:Bacteroidetes Ratio",
+         subtitle = paste0("Wilcoxon p = ", round(fb_test$p.value, 4)),
+         x = "Extraction Status",
+         y = "F:B Ratio") +
+    scale_fill_manual(values = c("Re-extracted" = "#E69F00", "Original" = "#56B4E9")) +
+    theme(legend.position = "none")
+  
+  print(p_fb)
+  ggsave("reextraction_fb_ratio.png", p_fb, width = 6, height = 5, dpi = 300)
+}
+
+```
+```{r}
+# Re-extraction × integron: confound check + integron effect controlling for extraction
+
+bc_dist <- phyloseq::distance(ps_rarefied, method = "bray")
+meta <- data.frame(sample_data(ps_rarefied))
+
+# Distribution of extraction status across integron groups
+extraction_integron_table <- table(meta$extraction_status, meta$Integron_group)
+cat("Extraction status by integron group:\n")
+print(extraction_integron_table)
+
+# Fisher's exact (small cells) — is re-extraction biased toward integron-positive?
+fisher_ei <- fisher.test(extraction_integron_table)
+cat("\nFisher's exact p =", round(fisher_ei$p.value, 4), "\n")
+cat("Re-extracted: 9/24 positives (37.5%) vs 1/38 negatives (2.6%)\n\n")
+
+# Integron effect controlling for extraction (partitioned by terms)
+set.seed(123)
+permanova_terms <- adonis2(bc_dist ~ extraction_status + Integron_group,
+                           data = meta, permutations = 999, by = "terms")
+cat("PERMANOVA (sequential terms): extraction then integron\n")
+print(permanova_terms)
+```
+
+```{r}
+# CHECKING EXTRACTION STATUS DISTRIBUTION ACROSS LOCATIONS
+
+extraction_location_table <- table(
+  sample_data(ps_rarefied)$extraction_status,
+  sample_data(ps_rarefied)$Location_group     # was $Location
+)
+
+cat("Distribution of extraction status by location:\n")
+print(extraction_location_table)
+
+chi_test_loc <- fisher.test(extraction_location_table)
+cat("\nChi-square test for independence:\n")
+cat("p-value =", chi_test_loc$p.value, "\n")
+if(chi_test_loc$p.value < 0.05) {
+  cat("Extraction status is NOT independent of location\n")
+} else {
+  cat("Extraction status is independent of location\n")
+}
+
+cat("\nProportions by location:\n")
+prop_table_loc <- prop.table(extraction_location_table, margin = 2) * 100
+print(round(prop_table_loc, 1))
+```
+
+```{r}
+# LOCATION_GROUP PERMANOVA WITH RE-EXTRACTION
+
+sample_df <- data.frame(sample_data(ps_rarefied))
+
+# Filter missing values
+valid_samples <- rownames(sample_df)[!is.na(sample_df$Location_group)]
+ps_complete <- prune_samples(valid_samples, ps_rarefied)
+sample_df <- data.frame(sample_data(ps_complete))
+bc_dist <- phyloseq::distance(ps_complete, method = "bray")
+
+# Convert to factor to ensure it's treated categorically
+sample_df$Location_group_factor <- factor(sample_df$Location_group)
+
+
+# Test with factor
+set.seed(123)
+permanova_factor <- adonis2(bc_dist ~ Location_group_factor, 
+                            data = sample_df, 
+                            permutations = 999)
+
+cat("PERMANOVA - Location_group as FACTOR:\n")
+print(permanova_factor)
+
+# With extraction control
+set.seed(123)
+permanova_factor_controlled <- adonis2(bc_dist ~ extraction_status + Location_group_factor, 
+                                       data = sample_df, 
+                                       permutations = 999)
+
+cat("\nPERMANOVA - Extraction + Location_group as FACTOR:\n")
+print(permanova_factor_controlled)
+```
+
+```{r}
+# Re-extraction validation — Akkermansia by location and extraction status
+
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x))
+tax_table_df <- as.data.frame(tax_table(ps_rel))
+akk_asvs <- rownames(tax_table_df)[tax_table_df$Genus == "Akkermansia" & !is.na(tax_table_df$Genus)]
+
+otu_mat <- as.matrix(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) otu_mat <- t(otu_mat)
+akk_abundance <- colSums(otu_mat[akk_asvs, , drop = FALSE]) * 100   # as %
+
+akk_df <- data.frame(
+  Sample = names(akk_abundance),
+  Akkermansia = akk_abundance,
+  Location = sample_data(ps_rel)$Location_group,        # was $Location
+  extraction_status = sample_data(ps_rel)$extraction_status
+)
+akk_df <- akk_df[!is.na(akk_df$Location), ]
+
+# Location effect (matches Fig 7: Kruskal p = 0.011)
+kw_test <- kruskal.test(Akkermansia ~ Location, data = akk_df)
+cat("Akkermansia by location — Kruskal-Wallis p =", round(kw_test$p.value, 4), "\n")
+print(aggregate(Akkermansia ~ Location, data = akk_df, FUN = function(x) round(mean(x), 1)))
+
+# Extraction effect (should be non-significant — no extraction bias)
+wilcox_akk <- wilcox.test(Akkermansia ~ extraction_status, data = akk_df)
+cat("\nAkkermansia by extraction status — Wilcoxon p =", round(wilcox_akk$p.value, 4), "\n")
+print(aggregate(Akkermansia ~ extraction_status, data = akk_df, FUN = function(x) round(mean(x), 1)))
+```
+
+```{r}
+# Re-extraction validation — Muribaculaceae by location and extraction status
+
+muri_asvs <- rownames(tax_table_df)[tax_table_df$Family == "Muribaculaceae" & !is.na(tax_table_df$Family)]
+
+otu_mat <- as.matrix(otu_table(ps_rel))
+if (!taxa_are_rows(ps_rel)) otu_mat <- t(otu_mat)
+muri_abundance <- colSums(otu_mat[muri_asvs, , drop = FALSE]) * 100   # as %
+
+muri_df <- data.frame(
+  Sample = names(muri_abundance),
+  Muribaculaceae = muri_abundance,
+  Location = sample_data(ps_rel)$Location_group,        # was $Location
+  extraction_status = sample_data(ps_rel)$extraction_status
+)
+muri_df <- muri_df[!is.na(muri_df$Location), ]
+
+# Location effect (drives Fig 6 / location DESeq2)
+kw_test_muri <- kruskal.test(Muribaculaceae ~ Location, data = muri_df)
+cat("Muribaculaceae by location — Kruskal-Wallis p =", round(kw_test_muri$p.value, 4), "\n")
+print(aggregate(Muribaculaceae ~ Location, data = muri_df, FUN = function(x) round(mean(x), 1)))
+
+# Extraction effect (should be non-significant)
+wilcox_muri <- wilcox.test(Muribaculaceae ~ extraction_status, data = muri_df)
+cat("\nMuribaculaceae by extraction status — Wilcoxon p =", round(wilcox_muri$p.value, 4), "\n")
+print(aggregate(Muribaculaceae ~ extraction_status, data = muri_df, FUN = function(x) round(mean(x), 1)))
+```
+
+## Microchipping 
+
+```{r}
+# MICROCHIPPING SETUP — clean microchip factor + female/all subsets
+
+# Clean microchip status (exact column name has a space)
+mc_raw <- as.character(sample_data(ps_rarefied)[["Previously microchipped"]])
+sample_data(ps_rarefied)$Microchip <- factor(tolower(trimws(mc_raw)), levels = c("no", "yes"))
+
+# All animals with valid microchip status
+keep_micro <- !is.na(sample_data(ps_rarefied)$Microchip)
+ps_micro <- prune_samples(sample_names(ps_rarefied)[keep_micro], ps_rarefied)
+cat("All animals with microchip status:", nsamples(ps_micro), "\n")
+print(table(sample_data(ps_micro)$Microchip))
+
+# Females only (n should be 37)
+ps_female <- prune_samples(
+  sample_names(ps_rarefied)[sample_data(ps_rarefied)$Sex == "Female"], ps_rarefied
+)
+cat("\nFemales:", nsamples(ps_female), "\n")
+print(table(sample_data(ps_female)$Microchip))
+```
+```{r}
+# Microchip status across Sex
+mc <- factor(tolower(trimws(as.character(sample_data(ps_rarefied)[["Previously microchipped"]]))), levels = c("no","yes"))
+sex <- as.character(sample_data(ps_rarefied)[["Sex"]])
+table(sex)
+table(sex, mc, useNA = "ifany")
+```
+
+```{r}
+# Sensitivity check: include "Female with Back Young" as female (n=43)
+sex_all <- as.character(sample_data(ps_rarefied)[["Sex"]])
+female_incl <- sample_names(ps_rarefied)[grepl("Female", sex_all)]
+ps_female_incl <- prune_samples(female_incl, ps_rarefied)
+
+# Microchip already exists on ps_rarefied, inherited by the subset
+meta_fi <- data.frame(sample_data(ps_female_incl))
+
+cat("Females incl. back-young:", nsamples(ps_female_incl), "\n")
+print(table(meta_fi$Microchip))
+
+bray_fi <- phyloseq::distance(ps_female_incl, method = "bray")
+set.seed(123)
+print(adonis2(bray_fi ~ Microchip, data = meta_fi, permutations = 999))
+```
+
+### Microchipping x Integron Status
+
+```{r}
+# Microchipping vs Integron status — does microchipping confound integron carriage?
+
+metadata <- data.frame(sample_data(ps_rarefied))
+clean_data <- metadata[!is.na(metadata$Microchip) & !is.na(metadata$Integron_group), ]
+
+# Contingency table (integron × microchip)
+table_result <- table(clean_data$Integron_group, clean_data$Microchip)
+cat("Integron × Microchip:\n")
+print(addmargins(table_result))
+
+cat("\nProportions (% integron positive by microchip status):\n")
+props <- prop.table(table_result, margin = 2) * 100
+print(round(props, 1))
+
+# Fisher's exact (small cells expected)
+test_result <- fisher.test(table_result)
+cat("\nFisher's exact p =", round(test_result$p.value, 4), "\n")
+cat("Integron-positive: non-microchipped", round(props["Positive","no"],1),
+    "% vs microchipped", round(props["Positive","yes"],1), "%\n")
+```
+
+```{r}
+# Confounding analysis (females only): does age or location confound microchipping?
+
+ps_female <- subset_samples(ps_rarefied, Sex == "Female")
+cat("Females:", nsamples(ps_female), "\n")   # should be 37
+
+metadata_f <- data.frame(sample_data(ps_female))
+
+# Microchip status as "Group" (yes/no), used by the downstream confounding tests
+metadata_f$Group <- factor(
+  tolower(trimws(as.character(metadata_f$Previously.microchipped))),
+  levels = c("no", "yes")
+)
+cat("Microchip status (females):\n")
+print(table(metadata_f$Group))
+```
+```{r}
+# Age class vs microchip status (females) — confound check
+age_tab <- table(metadata_f[["TWC...Estimated.age"]], metadata_f$Group)
+print(age_tab)
+print(fisher.test(age_tab, simulate.p.value = TRUE, B = 9999))
+```
+
+```{r}
+# Location vs microchipping (females) — the key confound
+
+loc_data <- metadata_f[!is.na(metadata_f$Location_group), ]
+loc_table <- table(loc_data$Location_group, loc_data$Group)
+
+cat("Location × microchip (females):\n")
+print(addmargins(loc_table))
+
+cat("\n% microchipped by location:\n")
+loc_props <- prop.table(loc_table, margin = 1) * 100
+print(round(loc_props, 1))
+
+# Fisher's exact (small cells)
+loc_test <- fisher.test(loc_table)
+cat("\nFisher's exact p =", round(loc_test$p.value, 5), "\n")
+```
+
+```{r}
+# Location vs Integron status — does location confound the main integron analysis?
+
+metadata <- data.frame(sample_data(ps_rarefied))
+clean <- metadata[!is.na(metadata$Location_group) & !is.na(metadata$Integron_group), ]
+
+loc_int_table <- table(clean$Location_group, clean$Integron_group)
+cat("Location × Integron:\n")
+print(addmargins(loc_int_table))
+
+cat("\n% integron-positive by location:\n")
+loc_int_props <- prop.table(loc_int_table, margin = 1) * 100
+print(round(loc_int_props[, "Positive"], 1))
+
+# Fisher's exact
+loc_int_test <- fisher.test(loc_int_table)
+cat("\nFisher's exact p =", round(loc_int_test$p.value, 4), "\n")
+```
+
+
+```{r}
+# Quick check: Sex vs Integron
+metadata <- data.frame(sample_data(ps_rarefied))
+clean <- metadata[!is.na(metadata$Sex) & !is.na(metadata$Integron_group), ]
+
+sex_int_table <- table(clean$Sex, clean$Integron_group)
+print(addmargins(sex_int_table))
+
+sex_int_test <- fisher.test(sex_int_table)
+cat("\nSex vs Integron: p =", round(sex_int_test$p.value, 4), "\n")
+```
+
+```{r}
+# Muribaculaceae: location effect vs microchip effect (confound demonstration)
+library(dplyr)
+
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)
+ps_murib <- subset_taxa(ps_rel, Family == "Muribaculaceae")
+
+metadata <- data.frame(sample_data(ps_rarefied))
+metadata$Muribaculaceae <- sample_sums(ps_murib)[rownames(metadata)]
+metadata$Microchip <- tolower(trimws(as.character(metadata$Previously.microchipped)))
+
+# 1. By location
+loc_data <- metadata %>% filter(!is.na(Location_group))
+loc_murib <- loc_data %>% group_by(Location_group) %>%
+  summarise(n = n(), Mean = round(mean(Muribaculaceae), 2), .groups = "drop")
+cat("Muribaculaceae by location:\n"); print(loc_murib)
+cat("Kruskal-Wallis p =", round(kruskal.test(Muribaculaceae ~ Location_group, data = loc_data)$p.value, 4), "\n\n")
+
+# 2. By microchip — all animals
+micro_data <- metadata %>% filter(Microchip %in% c("yes","no"))
+cat("Muribaculaceae by microchip (all animals):\n")
+print(micro_data %>% group_by(Microchip) %>% summarise(n = n(), Mean = round(mean(Muribaculaceae), 2), .groups = "drop"))
+cat("Wilcoxon p =", round(wilcox.test(Muribaculaceae ~ Microchip, data = micro_data)$p.value, 4), "\n\n")
+
+# 3. By microchip — FEMALES ONLY
+female_data <- metadata %>% filter(Sex == "Female" & Microchip %in% c("yes","no"))
+cat("Muribaculaceae by microchip (females only):\n")
+print(female_data %>% group_by(Microchip) %>% summarise(n = n(), Mean = round(mean(Muribaculaceae), 2), .groups = "drop"))
+cat("Wilcoxon p =", round(wilcox.test(Muribaculaceae ~ Microchip, data = female_data)$p.value, 4), "\n")
+```
+
+```{r}
+# Prior-capture DESeq2 — females only, unrarefied + poscounts
+library(DESeq2); library(phyloseq); library(dplyr)
+
+# Females from UNRAREFIED ps_corrected
+fem_names <- sample_names(ps_corrected)[sample_data(ps_corrected)$Sex == "Female"]
+ps_fem_raw <- prune_samples(fem_names, ps_corrected)
+
+# Pull the Microchip factor from ps_rarefied (already built in setup), matched by sample name
+mc_lookup <- sample_data(ps_rarefied)$Microchip
+names(mc_lookup) <- sample_names(ps_rarefied)
+sample_data(ps_fem_raw)$Microchip <- factor(mc_lookup[sample_names(ps_fem_raw)], levels = c("no","yes"))
+
+cat("Females (unrarefied):", nsamples(ps_fem_raw), "\n")
+print(table(sample_data(ps_fem_raw)$Microchip))
+
+# DESeq2 (poscounts)
+dds_f <- phyloseq_to_deseq2(ps_fem_raw, ~ Microchip)
+dds_f <- DESeq(dds_f, test = "Wald", fitType = "parametric", sfType = "poscounts")
+res_f <- results(dds_f, contrast = c("Microchip", "yes", "no"), alpha = 0.05)
+
+res_df <- as.data.frame(res_f); res_df$ASV <- rownames(res_df)
+tax_df <- as.data.frame(tax_table(ps_fem_raw)); tax_df$ASV <- rownames(tax_df)
+sig_f <- merge(res_df, tax_df, by = "ASV") %>% filter(padj < 0.05) %>% arrange(log2FoldChange)
+
+cat("\nSignificant ASVs (padj < 0.05):", nrow(sig_f), "\n")
+cat("Muribaculaceae among them:", sum(grepl("Muribaculaceae", sig_f$Family)), "\n\n")
+cat("Muribaculaceae ASVs:\n")
+print(sig_f[grepl("Muribaculaceae", sig_f$Family), c("Family","Genus","log2FoldChange","padj")])
+```
+
+```{r}
+# Location vs microchip effect on the significant Muribaculaceae ASVs (the "9-21x" comparison)
+library(dplyr)
+
+# Muribaculaceae ASV IDs from the prior-capture DESeq2 (sig_f, ASV in a column)
+microchip_murib_asvs <- sig_f$ASV[grepl("Muribaculaceae", sig_f$Family)]
+cat("Significant Muribaculaceae ASVs from microchip DESeq2:", length(microchip_murib_asvs), "\n")
+
+# Relative abundance + microchip lookup (matched by sample name)
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)
+metadata <- data.frame(sample_data(ps_rel))
+mc_lookup <- sample_data(ps_rarefied)$Microchip; names(mc_lookup) <- sample_names(ps_rarefied)
+metadata$Microchip <- as.character(mc_lookup[rownames(metadata)])
+
+for (asv in microchip_murib_asvs) {
+  ab <- as.numeric(otu_table(ps_rel)[asv, ]); names(ab) <- sample_names(ps_rel)
+  metadata$Abundance <- ab[rownames(metadata)]
+  loc_data <- metadata %>% filter(!is.na(Location_group))
+
+  loc1 <- mean(loc_data$Abundance[loc_data$Location_group == 1])
+  loc3 <- mean(loc_data$Abundance[loc_data$Location_group == 3])
+  kw <- kruskal.test(Abundance ~ Location_group, data = loc_data)$p.value
+
+  cat("\nASV:", asv, "\n")
+  cat("  Location 1 mean:", round(loc1, 3), "% | Location 3 mean:", round(loc3, 3), "%\n")
+  cat("  Fold (Loc1/Loc3):", ifelse(loc3 > 0, round(loc1/loc3, 1), "Inf"), "x | Location Kruskal p =", round(kw, 4), "\n")
+}
+```
+
+```{r}
+# Prior-capture: sex confound + PERMANOVA (all + females) + betadisper
+library(vegan); library(phyloseq)
+
+# Microchip lookup from ps_rarefied (built in setup)
+mc_lookup <- sample_data(ps_rarefied)$Microchip; names(mc_lookup) <- sample_names(ps_rarefied)
+
+# --- Fisher: sex × microchip (all 13 microchipped were female) ---
+meta_all <- data.frame(sample_data(ps_rarefied))
+meta_all$Microchip <- mc_lookup[rownames(meta_all)]
+cat("Sex × microchip:\n"); print(table(meta_all$Sex, meta_all$Microchip))
+cat("Fisher p =", round(fisher.test(table(meta_all$Sex, meta_all$Microchip))$p.value, 4), "\n\n")
+
+# --- Prior-capture PERMANOVA, ALL animals ---
+bray_all <- phyloseq::distance(ps_rarefied, method = "bray")
+set.seed(123)
+perm_all <- adonis2(bray_all ~ Microchip, data = meta_all, permutations = 999)
+cat("Prior-capture PERMANOVA (all animals, n=62):\n"); print(perm_all)
+
+# --- Females only: PERMANOVA + betadisper ---
+ps_female <- subset_samples(ps_rarefied, Sex == "Female")
+meta_f <- data.frame(sample_data(ps_female))
+meta_f$Microchip <- factor(mc_lookup[rownames(meta_f)], levels = c("no","yes"))
+bray_f <- phyloseq::distance(ps_female, method = "bray")
+
+set.seed(123)
+perm_f <- adonis2(bray_f ~ Microchip, data = meta_f, permutations = 999)
+cat("\nFemales-only PERMANOVA (n=37):\n"); print(perm_f)
+
+set.seed(123)
+disp_f <- betadisper(bray_f, meta_f$Microchip)
+cat("\nBetadisper (females):\n"); print(anova(disp_f))
+```
+
+```{r}
+# Total Muribaculaceae direct test — does rarefied counts give the manuscript's 0.494?
+murib_counts <- sample_sums(subset_taxa(ps_rarefied, Family == "Muribaculaceae"))
+md <- data.frame(sample_data(ps_rarefied))
+md$MuribCount <- murib_counts[rownames(md)]
+md$Microchip <- mc_lookup[rownames(md)]
+fem <- md[md$Sex == "Female" & md$Microchip %in% c("yes","no"), ]
+cat("Females, total Muribaculaceae (rarefied counts) — Wilcoxon p =",
+    round(wilcox.test(MuribCount ~ Microchip, data = fem)$p.value, 4), "\n")
+all_an <- md[md$Microchip %in% c("yes","no"), ]
+cat("All animals, total Muribaculaceae (rarefied counts) — Wilcoxon p =",
+    round(wilcox.test(MuribCount ~ Microchip, data = all_an)$p.value, 4), "\n")
+```
+
+## Spearmans Correlation Check
+
+```{r}
+# Spearman collinearity check among metadata variables
+library(dplyr)
+
+meta_coll <- data.frame(sample_data(ps_rarefied), check.names = FALSE)
+
+# Convert predictors to numeric/ordinal for correlation
+# (categorical variables coded as integers; ordinal where applicable)
+coll_df <- data.frame(
+  Integron  = as.numeric(factor(meta_coll$Integron_group)),
+  Location  = as.numeric(factor(meta_coll$Location_group)),
+  Sex       = as.numeric(factor(meta_coll$Sex)),
+  BCS       = as.numeric(factor(meta_coll$BCS,
+                  levels = c("Emaciated","Poor","Fair","Good","Excellent"), ordered = TRUE)),
+  Age       = as.numeric(factor(meta_coll$`TWC - Estimated age`)),
+  Weight    = as.numeric(meta_coll$`Animal Weight (Kg)`),
+  Chlamydia = as.numeric(factor(ifelse(meta_coll$`Chlamydia UGT` == "0", "Neg", "Pos")))
+)
+
+# Spearman correlation matrix
+coll_matrix <- cor(coll_df, method = "spearman", use = "pairwise.complete.obs")
+cat("Spearman correlation matrix among metadata variables:\n")
+print(round(coll_matrix, 2))
+```
+
+```{r}
+library(phyloseq); library(ggplot2); library(patchwork); library(dplyr)
+
+# Location colours matching your map/NMDS slides
+loc_colours <- c("1" = "#E6A817", "2" = "#6BAED6", "3" = "#2E8B57")  # orange / blue / green
+
+# Relative abundance (%) 
+ps_rel <- transform_sample_counts(ps_rarefied, function(x) x / sum(x) * 100)
+
+# --- Muribaculaceae (family) by location ---
+muri <- subset_taxa(ps_rel, Family == "Muribaculaceae")
+md <- data.frame(sample_data(ps_rel))
+md$Muribaculaceae <- sample_sums(muri)[rownames(md)]
+
+# --- Akkermansia (genus) by location ---
+akk <- subset_taxa(ps_rel, Genus == "Akkermansia")
+md$Akkermansia <- sample_sums(akk)[rownames(md)]
+
+# Drop samples with no location
+md <- md[!is.na(md$Location_group), ]
+md$Location_group <- factor(md$Location_group, levels = c("1","2","3"))
+
+# Shared theme
+box_theme <- theme_bw(base_size = 14) +
+  theme(legend.position = "none",
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text  = element_text(size = 13, color = "black"),
+        plot.title = element_text(size = 15, face = "bold.italic", hjust = 0.5),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+
+# Panel A — Muribaculaceae
+p_muri <- ggplot(md, aes(Location_group, Muribaculaceae, fill = Location_group)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA) +
+  geom_jitter(width = 0.18, alpha = 0.5, size = 1.8) +
+  scale_fill_manual(values = loc_colours) +
+  labs(title = "Muribaculaceae", x = "Location", y = "Relative abundance (%)") +
+  box_theme
+
+# Panel B — Akkermansia
+p_akk <- ggplot(md, aes(Location_group, Akkermansia, fill = Location_group)) +
+  geom_boxplot(alpha = 0.75, outlier.shape = NA) +
+  geom_jitter(width = 0.18, alpha = 0.5, size = 1.8) +
+  scale_fill_manual(values = loc_colours) +
+  labs(title = "Akkermansia", x = "Location", y = "Relative abundance (%)") +
+  box_theme
+
+# Combine side by side
+fig <- p_muri + p_akk + plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = 14, face = "bold"))
+print(fig)
+
+ggsave("Figure_location_taxa.png", fig, width = 10, height = 5, dpi = 300, bg = "white")
+```
+
