@@ -70,7 +70,7 @@ top-to-bottom from a clean session.
 
 ## Software
 
-Analysis was performed in R (version X.X.X). Key packages: phyloseq, vegan, DESeq2,
+Analysis was performed in R (version 2025.08.0-daily+88). Key packages: phyloseq, vegan, DESeq2,
 microbiome, ape, tidyverse, patchwork, FSA.
 
 Note that `microbiome` and `phyloseq` mask several dplyr verbs (`select`, `rename`,
