@@ -37,12 +37,6 @@ The following files are expected in the working directory:
 Raw sequence data are deposited in the NCBI Sequence Read Archive under BioProject
 [PRJNA1402904](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA1402904).
 
-Sample metadata and capture coordinates are **not included** in this repository, as
-they contain location data for a threatened species. Please contact the
-corresponding author for access.
-
-Note that the analysis cannot be run end-to-end without these files.
-
 ## Analysis notes
 
 **Object flow**
